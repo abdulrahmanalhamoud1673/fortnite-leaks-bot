@@ -1,0 +1,34 @@
+name: Fortnite leaks to Discord
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (keeps a private repo inside the free Actions minutes)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: leaks
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Post new leaks
+        run: python leaks.py
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      - name: Save what was posted
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "leaks-bot"
+            git config user.email "leaks-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "leaks: remember posted items"
+            git push
+          fi
