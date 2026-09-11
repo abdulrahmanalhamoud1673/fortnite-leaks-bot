@@ -709,7 +709,22 @@ def run_gta(st, webhook):
 
 
 # ---------------------------------------------------------------- main
+def selftest():
+    """Print (in the Actions log, nothing is posted) a sample Arabic rewrite, to prove the Gemini key works."""
+    print("selftest: GEMINI_API_KEY is", "set" if os.environ.get("GEMINI_API_KEY") else "MISSING")
+    try:
+        items = parse_rss(http_get(AR_FEEDS[0][0]), AR_FEEDS[0][1])
+        e = news_embed(next(x for x in items if GTA_KEEP.search(x["title"])), "selftest", 0xF59E0B)
+        print("selftest GTA:", json.dumps({"title": e["title"], "description": e["description"]}, ensure_ascii=False))
+        m = mc_version_embed(mc_versions()[0])
+        print("selftest MC:", json.dumps({"title": m["title"], "description": m["description"]}, ensure_ascii=False))
+    except Exception as ex:
+        print("selftest failed:", repr(ex))
+
+
 def main():
+    if os.environ.get("LEAKS_SELFTEST") == "1":
+        selftest()
     state = load_state()
     jobs = [("fortnite", "DISCORD_WEBHOOK", run_fortnite),
             ("minecraft", "DISCORD_WEBHOOK_MINECRAFT", run_minecraft),

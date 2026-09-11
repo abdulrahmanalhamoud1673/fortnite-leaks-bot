@@ -12,6 +12,10 @@ on:
         description: "Queued by the previous run (waits 5 minutes first)"
         type: boolean
         default: false
+      selftest:
+        description: "Also print a sample Arabic rewrite in the log (checks the Gemini key)"
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: [".github/workflows/**", "leaks.py", "cards.py", "arabic.py"]
@@ -48,6 +52,7 @@ jobs:
           DISCORD_WEBHOOK_MINECRAFT: ${{ secrets.DISCORD_WEBHOOK_MINECRAFT }}
           DISCORD_WEBHOOK_GTA: ${{ secrets.DISCORD_WEBHOOK_GTA }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LEAKS_SELFTEST: ${{ inputs.selftest && '1' || '' }}
       - name: Save what was posted
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
