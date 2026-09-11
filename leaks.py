@@ -6,12 +6,14 @@ its own webhook secret; a game whose secret is missing is simply skipped.
 
   fortnite   DISCORD_WEBHOOK            new game versions, items datamined into the game files and
                                         what is new in the item shop (fortnite-api.com), drawn as one
-                                        zoomable picture (cards.py) plus Epic's clips of the emotes
-  minecraft  DISCORD_WEBHOOK_MINECRAFT  new Java snapshots/pre-releases/releases (Mojang) + news
-  gta        DISCORD_WEBHOOK_GTA        Arabic GTA 5 / GTA 6 news headlines (Google News)
+                                        zoomable picture sorted into sections (cards.py) plus Epic's clips
+  minecraft  DISCORD_WEBHOOK_MINECRAFT  every snapshot/pre-release/release with Mojang's own patch-note picture,
+                                        Mojang's official news, and Arabic Minecraft news with pictures
+  gta        DISCORD_WEBHOOK_GTA        GTA 5 / GTA 6 news from Arabic gaming sites, each with its picture
 
 Everything already posted is remembered in state.json, so nothing is sent twice.
 """
+import html
 import json
 import os
 import re
@@ -30,14 +32,18 @@ DRY_RUN = os.environ.get("DRY_RUN") == "1"
 PREVIEW = os.environ.get("PREVIEW_DIR")          # with DRY_RUN, pictures are written here instead of sent
 AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr5Mc6SPFurxKFMqe1m02dQ2z7MgvhIxX8pybPs"
           "=s256-c-k-c0x00ffffff-no-rj")
-UA = {"User-Agent": "Mozilla/5.0 (compatible; abod-leaks-bot/1.3)"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/128 Safari/537.36 abod-leaks-bot/1.4"}
+_CACHE = {}
 
 
 # ---------------------------------------------------------------- helpers
 def http_get(url):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+    if url not in _CACHE:                      # the GTA and Minecraft jobs read the same Arabic feeds
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            _CACHE[url] = r.read()
+    return _CACHE[url]
 
 
 def load_state():
@@ -76,7 +82,7 @@ def send(webhook, body, content_type):
 def post(webhook, name, payload):
     payload = {"username": name, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
     if DRY_RUN:
-        print("   DRY:", json.dumps(payload, ensure_ascii=False)[:260])
+        print("   DRY:", json.dumps(payload, ensure_ascii=False)[:300])
         return
     send(webhook, json.dumps(payload).encode("utf-8"), "application/json")
 
@@ -88,7 +94,7 @@ def post_file(webhook, name, payload, filename, data):
         if PREVIEW:
             with open(os.path.join(PREVIEW, filename), "wb") as f:
                 f.write(data)
-        print(f"   DRY: {filename} ({len(data) // 1024} KB) +", json.dumps(payload, ensure_ascii=False)[:200])
+        print(f"   DRY: {filename} ({len(data) // 1024} KB) +", json.dumps(payload, ensure_ascii=False)[:300])
         return
     boundary = "abodleaks" + os.urandom(8).hex()
     body = b"".join([
@@ -99,60 +105,149 @@ def post_file(webhook, name, payload, filename, data):
     send(webhook, body, f"multipart/form-data; boundary={boundary}")
 
 
-def parse_rss(raw):
-    items = []
-    for it in ET.fromstring(raw).iter("item"):
-        title = (it.findtext("title") or "").strip()
-        source = (it.findtext("source") or "").strip()
-        if source and title.endswith(" - " + source):
-            title = title[: -len(source) - 3]
-        try:
-            pub = parsedate_to_datetime(it.findtext("pubDate") or "")
-        except (TypeError, ValueError):
-            pub = datetime.now(timezone.utc)
-        items.append({"title": title, "link": (it.findtext("link") or "").strip(), "source": source, "pub": pub})
-    return items
-
-
 def norm(title):
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", title.lower())).strip()[:60]
 
 
-def run_news(st, webhook, name, feed, keep, noise, label, color, intro, per_run=3, per_day=10, max_age_h=24):
-    """Post fresh, relevant headlines from an RSS feed; remember links and titles."""
-    items = parse_rss(http_get(feed))
+SAME = {"بلايستيشن": "playstation", "ps5": "playstation", "روكستار": "rockstar", "تريلر": "trailer",
+        "الدعائي": "trailer", "دعائي": "trailer"}
+STOP = {"gta", "لعبة", "لعب", "على", "عن", "من", "مع", "بعد", "قبل", "هل", "the", "and", "for", "with"}
+
+
+def stems(title):
+    """Rough Arabic stems (no ال/و/ب prefixes, no ات/ون/ة endings), so two sites' headlines can be compared."""
+    out = set()
+    for w in norm(title).split():
+        w = SAME.get(w, w)
+        if len(w) > 4:
+            w = re.sub(r"^(وال|بال|فال|كال|لل|ال|و|ب|ف)", "", w)
+        if len(w) > 4:
+            w = re.sub(r"(ات|ون|ين|ية|ة|ه)$", "", w)
+        w = SAME.get(w, w)
+        if len(w) >= 3 and w not in STOP:
+            out.add(w)
+    return out
+
+
+def similar(sa, sb):
+    """Same story? sa/sb are stems() of two headlines — sites rarely word the same news alike."""
+    shared = len(sa & sb)
+    return shared >= 4 or (shared >= 3 and shared / max(1, min(len(sa), len(sb))) >= 0.5)
+
+
+def plain(text):
+    text = re.sub(r"<[^>]+>", " ", html.unescape(text or ""))
+    text = re.sub(r"(The post|ظهرت المقالة|The article).*$", "", text, flags=re.S)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+MEDIA = "{http://search.yahoo.com/mrss/}"
+CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
+
+
+def parse_rss(raw, source=""):
+    items = []
+    for it in ET.fromstring(raw).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip() or source
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3]
+        try:
+            pub = parsedate_to_datetime(it.findtext("pubDate") or "")
+        except (TypeError, ValueError):
+            pub = datetime.now(timezone.utc)
+        body = it.findtext(CONTENT) or it.findtext("description") or ""
+        image = None
+        enc = it.find("enclosure")
+        if enc is not None and (enc.get("type") or "").startswith("image"):
+            image = enc.get("url")
+        for tag in (MEDIA + "content", MEDIA + "thumbnail"):
+            if not image and it.find(tag) is not None:
+                image = it.find(tag).get("url")
+        if not image:
+            m = re.search(r'<img[^>]+src=["\']([^"\']+)', body)
+            image = html.unescape(m.group(1)) if m else None
+        items.append({"title": title, "link": (it.findtext("link") or "").strip(), "source": src, "pub": pub,
+                      "image": image, "summary": plain(it.findtext("description") or body)})
+    return items
+
+
+def og_image(url):
+    """The article's own share picture, for feeds that don't carry one."""
+    try:
+        page = http_get(url)[:600_000].decode("utf-8", "ignore")
+    except Exception:
+        return None
+    m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page)
+         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image', page))
+    return html.unescape(m.group(1)) if m else None
+
+
+# ---------------------------------------------------------------- Arabic gaming news (GTA + Minecraft)
+AR_FEEDS = [("https://me.ign.com/ar/feed.xml", "IGN الشرق الأوسط"),        # سعودي جيمر answers bots with 403
+            ("https://www.true-gaming.net/home/feed/", "ترو جيمنج")]
+IMPORTANT = re.compile(r"رسمي|تريلر|العرض الدعائي|عرض دعائي|موعد|تأجيل|سعر|تسريب|تكشف|تعلن|الإعلان|"
+                       r"trailer|release date|leak|official|delay", re.I)
+FEEDS_VERSION = 2                              # 1 = Google News headlines without pictures
+
+
+def news_embed(it, image, label, color):
+    important = bool(IMPORTANT.search(it["title"]))
+    summary = it.get("summary") or ""
+    if len(summary) > 240:
+        summary = summary[:240].rsplit(" ", 1)[0] + "…"
+    lines = [summary] if summary and not summary.startswith(it["title"][:30]) else []
+    lines.append(f"📰 {it['source']}" + ("  •  🔥 **خبر مهم**" if important else ""))
+    e = {"title": (("🔥 " if important else "") + it["title"])[:250], "url": it["link"],
+         "description": "\n\n".join(lines)[:700], "color": 0xEF4444 if important else color,
+         "footer": {"text": label}, "timestamp": it["pub"].isoformat()}
+    if image:
+        e["image"] = {"url": image}
+    return e
+
+
+def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=3, per_day=10, max_age_h=36):
+    """Fresh, relevant articles from the Arabic gaming sites, each posted with its picture."""
+    items = []
+    for url, source in AR_FEEDS:
+        try:
+            items += parse_rss(http_get(url), source)
+        except Exception as e:                  # one site down must not stop the others
+            print(f"   {label}: {source} failed: {e!r}")
     seen = set(st.get("seen", []))
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
     if st.get("day") != today:
         st["day"], st["count"] = today, 0
+    brand_new, switching = not seen, st.get("src") != FEEDS_VERSION
+    posted = [p for p in st.get("titles", []) if isinstance(p, list) and len(p) == 2]
+    cutoff = (now - timedelta(hours=48)).isoformat()
+    covered = [t for d, t in posted if d >= cutoff]           # stories posted in the last two days
+    if switching:                               # plus whatever the old headline source already covered
+        covered += [s for s in seen if not s.startswith("http")]
+    known = [stems(t) for t in covered]
 
-    relevant = [it for it in items
-                if it["link"] not in seen and norm(it["title"]) not in seen
-                and (not keep or keep.search(it["title"]))
-                and not (noise and noise.search(it["title"] + " " + it["source"]))
-                and now - it["pub"] <= timedelta(hours=max_age_h)]
-    relevant.sort(key=lambda x: x["pub"], reverse=True)
-    batch, keys = [], set()                   # the same story from several sites → keep one
-    for it in relevant:
-        key = norm(it["title"])[:35]
-        if key in keys:
-            continue
-        keys.add(key)
-        batch.append(it)
-
-    first = not st.get("seen")
+    relevant = sorted((it for it in items
+                       if it["link"] not in seen and norm(it["title"]) not in seen and keep.search(it["title"])
+                       and not (noise and noise.search(it["title"] + " " + it["source"]))
+                       and now - it["pub"] <= timedelta(hours=max_age_h)), key=lambda x: x["pub"], reverse=True)
+    batch = []
+    for it in relevant:                         # the same story from several sites → the newest one only
+        s = stems(it["title"])
+        if not any(similar(s, k) for k in known):
+            batch.append(it)
+            known.append(s)
     room = max(0, per_day - st.get("count", 0))
-    chosen = batch[: (2 if first else min(per_run, room))]
-    if first:
+    chosen = batch[: (2 if brand_new else 1 if switching else min(per_run, room))]
+    if brand_new and intro:
         post(webhook, name, {"content": intro})
     for it in reversed(chosen):
-        post(webhook, name, {"embeds": [{
-            "title": it["title"][:250], "url": it["link"], "description": ("📰 " + it["source"])[:300],
-            "color": color, "footer": {"text": label}, "timestamp": it["pub"].isoformat()}]})
-    st["count"] = st.get("count", 0) + (0 if first else len(chosen))
-    st["seen"] = (list(seen) + [x for it in items for x in (it["link"], norm(it["title"]))])[-1500:]
-    print(f"   {label}: {len(items)} in feed, {len(batch)} relevant, posted {len(chosen)}")
+        post(webhook, name, {"embeds": [news_embed(it, it.get("image") or og_image(it["link"]), label, color)]})
+    st["count"] = st.get("count", 0) + len(chosen)
+    st["seen"] = (list(seen) + [x for it in items for x in (it["link"], norm(it["title"]))])[-2000:]
+    st["titles"] = (posted + [[it["pub"].astimezone(timezone.utc).isoformat(), it["title"]] for it in chosen])[-150:]
+    st["src"] = FEEDS_VERSION
+    print(f"   {label}: {len(items)} articles, {len(batch)} new and relevant, posted {len(chosen)}")
 
 
 # ---------------------------------------------------------------- Fortnite
@@ -163,6 +258,7 @@ FN_ITEM = "https://fortnite-api.com/v2/cosmetics/br/"
 FN_NAME = "تسريبات أبود 🔥"
 FOOTER = "تسريبات أبود  •  كل جديد فورتنايت أول بأول  •  youtube.com/@Ab_sn6"
 SHOP_DESIGN = 2                                # bump to re-post today's shop once in a new look
+MAX_TILES = 35
 RARITY = {
     "mythic": (9, 0xF4C430), "legendary": (8, 0xF39C12), "icon": (8, 0x2EC4DC),
     "marvel": (8, 0xC0392B), "dc": (8, 0x3A6BC7), "starwars": (8, 0x3B3B3B),
@@ -171,6 +267,9 @@ RARITY = {
     "epic": (6, 0x9B59B6), "rare": (4, 0x3498DB), "uncommon": (2, 0x2ECC71), "common": (1, 0x95A5A6),
 }
 TYPE_WEIGHT = {"outfit": 5, "backpack": 3, "pickaxe": 3, "glider": 3, "emote": 3, "wrap": 2}
+SECTIONS = [("bundle", "الباقات", "📦"), ("outfit", "السكنات", "🧍"), ("emote", "الرقصات", "💃"),
+            ("pickaxe", "الفؤوس", "⛏️"), ("backpack", "زينة الظهر", "🎒"), ("glider", "المظلات", "🪂"),
+            ("wrap", "الأغلفة", "🎨"), ("other", "أشياء ثانية", "✨")]
 AR_DAYS = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 AR_MONTHS = ["كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران",
              "تموز", "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول"]
@@ -190,9 +289,30 @@ def item_kind(item):
     return ((item.get("type") or {}).get("value") or "").lower()
 
 
+def section_key(kind):
+    return kind if kind in {"outfit", "emote", "pickaxe", "backpack", "glider", "wrap"} else "other"
+
+
 def fn_weight(item):
     rarity = ((item.get("rarity") or {}).get("value") or "").lower()
     return RARITY.get(rarity, (0, 0))[0] * 10 + TYPE_WEIGHT.get(item_kind(item), 1)
+
+
+def group(things, key_of, tiles_of):
+    """Split into the SECTIONS order. Returns ([(section title, tiles)], summary line, how many drawn)."""
+    buckets = {}
+    for x in things:
+        buckets.setdefault(key_of(x), []).append(x)
+    sections, summary, room = [], [], MAX_TILES
+    for key, title, emoji in SECTIONS:
+        xs = buckets.get(key) or []
+        if not xs:
+            continue
+        summary.append(f"{emoji} {title}: {len(xs)}")
+        if room > 0:
+            sections.append((title, tiles_of(xs[:room])))
+            room -= len(xs[:room])
+    return sections, " • ".join(summary), MAX_TILES - room
 
 
 def card_embed(title, lines, filename):
@@ -229,6 +349,8 @@ def post_videos(webhook, pairs, lookup, limit=4, max_lookups=12):
         caption = {"emote": f"💃 **{name}** — شوفوا الرقصة ▶️{tail}",
                    "outfit": f"🧍 **{name}** — شوفوا السكن من كل الجهات ▶️{tail}"}.get(
             item_kind(item), f"✨ **{name}** ▶️{tail}")
+        if shown == 0:
+            caption = "🎬 **شوفوها بالحركة:**\n" + caption
         post(webhook, FN_NAME, {"content": f"{caption}\nhttps://www.youtube.com/watch?v={vid}"})
         shown += 1
     return shown
@@ -260,9 +382,7 @@ def leak_tiles(items):
         colors = ((cards.hex_rgb(series[0]), cards.hex_rgb(series[-1])) if len(series) >= 2
                   else (cards.shade(base, 1.25), cards.shade(base, 0.45)))
         images = it.get("images") or {}
-        line = " • ".join(x for x in ((it.get("type") or {}).get("displayValue"),
-                                      (it.get("series") or {}).get("value")
-                                      or (it.get("rarity") or {}).get("displayValue")) if x)
+        line = (it.get("series") or {}).get("value") or (it.get("rarity") or {}).get("displayValue") or ""
         tiles.append({"name": it.get("name") or it.get("id") or "؟", "line": line, "colors": colors,
                       "image": images.get("featured") or images.get("icon") or images.get("smallIcon")})
     return tiles
@@ -294,29 +414,30 @@ def run_fn_leaks(st, webhook):
     if not fresh:
         print(f"   fortnite leaks: nothing new (build {build})")
         return
-    top = fresh[:(6 if first else 30)]
+    pool = fresh[:6] if first else fresh
+    sections, summary, drawn = group(pool, lambda it: section_key(item_kind(it)), leak_tiles)
     if first:
         title = "✅ بوت التسريبات اشتغل!"
-        lines = ["من هلأ، كل ما ينزل تحديث لفورتنايت، رح توصلكم هون السكنات والرقصات والأدوات الجديدة "
-                 f"اللي انضافت لملفات اللعبة 👀", f"هاي عيّنة من آخر تحديث ({build})"]
+        lines = [f"🧩 التحديث {build}", summary,
+                 "من هلأ، كل ما ينزل تحديث لفورتنايت، رح توصلكم هون السكنات والرقصات والأدوات الجديدة 👀"]
     else:
-        title = "🔥 تسريبات جديدة بفورتنايت!"
-        lines = [f"🧩 التحديث {build}", f"🆕 انضاف {len(fresh)} عنصر جديد لملفات اللعبة (سكنات، رقصات، أدوات…)"]
-        if len(fresh) > len(top):
-            lines.append(f"➕ وكمان {len(fresh) - len(top)} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀")
+        title = f"🔥 تسريبات جديدة بفورتنايت — التحديث {build}"
+        lines = [f"🆕 انضاف {len(fresh)} عنصر جديد لملفات اللعبة", summary]
+        if len(fresh) > drawn:
+            lines.append(f"➕ وكمان {len(fresh) - drawn} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀")
     try:
         jpg = cards.draw_card("تسريبات فورتنايت", f"التحديث {build} • {len(fresh)} عنصر جديد بملفات اللعبة",
-                              leak_tiles(top), FOOTER, AVATAR)
+                              sections, FOOTER, AVATAR)
         post_file(webhook, FN_NAME, {"embeds": [card_embed(title, lines, "leaks.jpg")]}, "leaks.jpg", jpg)
     except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
         print(f"   leaks card failed ({e!r}) — sending embeds instead")
         post(webhook, FN_NAME, {"content": f"**{title}**\n" + "\n".join(lines)})
-        for i in range(0, len(top), 10):
-            post(webhook, FN_NAME, {"embeds": [fn_embed(x) for x in top[i:i + 10]]})
-    videos = post_videos(webhook, [(x, None) for x in top], lookup=False)
+        for i in range(0, min(30, len(pool)), 10):
+            post(webhook, FN_NAME, {"embeds": [fn_embed(x) for x in pool[i:i + 10]]})
+    videos = post_videos(webhook, [(x, None) for x in pool[:MAX_TILES]], lookup=False)
     st.update({"build": data.get("build"), "date": data.get("date"),
                "posted": sorted(posted | {x.get("id") for x in items if x.get("id")})[-3000:]})
-    print(f"   fortnite leaks: {len(fresh)} new from build {build}, card with {len(top)}, {videos} videos")
+    print(f"   fortnite leaks: {len(fresh)} new from build {build}, card with {drawn}, {videos} videos")
 
 
 def shop_weight(entry):
@@ -353,9 +474,9 @@ def shop_tiles(entries):
     for e in entries:
         bundle, main, c = e.get("bundle") or {}, shop_main(e), e.get("colors") or {}
         renders = (e.get("newDisplayAsset") or {}).get("renderImages") or []
+        badge = f"{len(e['brItems'])} عناصر" if bundle else (main.get("type") or {}).get("displayValue")
         tiles.append({"name": bundle.get("name") or main.get("name") or "؟",
-                      "price": e.get("finalPrice"), "regular": e.get("regularPrice"),
-                      "badge": "باقة" if bundle else (main.get("type") or {}).get("displayValue"),
+                      "price": e.get("finalPrice"), "regular": e.get("regularPrice"), "badge": badge,
                       "colors": (cards.hex_rgb(c.get("color1")), cards.hex_rgb(c.get("color3") or c.get("color2"))),
                       "image": (renders[0].get("image") if renders else None) or bundle.get("image")
                       or (main.get("images") or {}).get("icon")})
@@ -389,29 +510,30 @@ def run_fn_shop(st, webhook):
     if not unique:
         print("   fortnite shop: changed, nothing new")
         return
-    top = unique[:30]
+    sections, summary, drawn = group(
+        unique, lambda e: "bundle" if e.get("bundle") else section_key(item_kind(shop_main(e))), shop_tiles)
     if not known:
         title = "🛒 متجر فورتنايت اليوم"
-        lines = [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد",
-                 "من هلأ، كل ما يتجدد المتجر (الساعة 3 الفجر) رح ينزل هون الجديد فيه أول بأول"]
+        extra = ["من هلأ، كل ما يتجدد المتجر (الساعة 3 الفجر) رح ينزل هون الجديد فيه أول بأول"]
     elif new_day:
-        title, lines = "🛒 متجر فورتنايت الجديد نزل!", [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد اليوم"]
+        title, extra = "🛒 متجر فورتنايت الجديد نزل!", []
     else:
-        title, lines = "🛒 انضافت أشياء جديدة للمتجر!", [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد"]
-    if len(unique) > len(top):
-        lines.append(f"➕ وكمان {len(unique) - len(top)} عنصر — شوفوهم باللعبة 🎮")
+        title, extra = "🛒 انضافت أشياء جديدة للمتجر!", []
+    lines = [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد", summary] + extra
+    if len(unique) > drawn:
+        lines.append(f"➕ وكمان {len(unique) - drawn} عنصر — شوفوهم باللعبة 🎮")
     try:
-        jpg = cards.draw_card("متجر فورتنايت", f"{ar_date(date)} • {len(unique)} عنصر جديد", shop_tiles(top),
-                              FOOTER, AVATAR)
+        jpg = cards.draw_card("متجر فورتنايت", f"{ar_date(date)} • {len(unique)} عنصر جديد", sections, FOOTER, AVATAR)
         post_file(webhook, FN_NAME, {"embeds": [card_embed(title, lines, "shop.jpg")]}, "shop.jpg", jpg)
     except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
         print(f"   shop card failed ({e!r}) — sending embeds instead")
         post(webhook, FN_NAME, {"content": f"**{title}**\n" + "\n".join(lines)})
-        for i in range(0, min(20, len(top)), 10):
-            post(webhook, FN_NAME, {"embeds": [shop_embed(e) for e in top[i:i + 10]]})
-    pairs = [(it, e.get("finalPrice") if len(e["brItems"]) == 1 else None) for e in top for it in e["brItems"]]
+        for i in range(0, min(20, len(unique)), 10):
+            post(webhook, FN_NAME, {"embeds": [shop_embed(e) for e in unique[i:i + 10]]})
+    pairs = [(it, e.get("finalPrice") if len(e["brItems"]) == 1 else None)
+             for e in unique[:MAX_TILES] for it in e["brItems"]]
     videos = post_videos(webhook, pairs, lookup=True)
-    print(f"   fortnite shop: {len(unique)} new offers, card with {len(top)}, {videos} videos")
+    print(f"   fortnite shop: {len(unique)} new offers, card with {drawn}, {videos} videos")
 
 
 def run_fortnite(st, webhook):
@@ -425,13 +547,22 @@ def run_fortnite(st, webhook):
 
 # ---------------------------------------------------------------- Minecraft
 MC_NAME = "تسريبات أبود ⛏️"
+MOJANG = "https://launchercontent.mojang.com"
 MC_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
-MC_NEWS = ("https://news.google.com/rss/search?q=intitle:Minecraft+(snapshot+OR+update+OR+drop+OR+leak+OR+"
-           "%22Minecraft+Live%22+OR+beta)+when:2d&hl=en-US&gl=US&ceid=US:en")
-MC_NOISE = re.compile(
-    r"horion|client|hack|cheat|apk|mod menu|download|crack|youtube|seed|coupon|deal|price"
-    r"|^Minecraft\s+[\d.]+.*(snapshot|pre-release|release candidate)",   # changelogs are covered by the version posts
-    re.I)
+MC_AR_KEEP = re.compile(r"Minecraft|ماين\s*كرافت|ماينكرافت|Mojang|موجانج", re.I)
+
+
+def mc_versions():
+    """Mojang's patch notes (with their picture and summary); the bare version list if those fail."""
+    try:
+        notes = json.loads(http_get(MOJANG + "/v2/javaPatchNotes.json"))["entries"]
+        notes.sort(key=lambda e: e.get("date") or "", reverse=True)
+        return [{"id": e.get("version"), "type": e.get("type"), "time": e.get("date"), "text": e.get("shortText"),
+                 "image": MOJANG + e["image"]["url"] if (e.get("image") or {}).get("url") else None} for e in notes]
+    except Exception as e:
+        print(f"   minecraft patch notes failed ({e!r}) — using the version list")
+        return [{"id": v["id"], "type": v["type"], "time": v.get("releaseTime")}
+                for v in json.loads(http_get(MC_MANIFEST))["versions"]]
 
 
 def mc_version_embed(v):
@@ -445,43 +576,79 @@ def mc_version_embed(v):
         kind = "🧪 **Pre-Release** — آخر مرحلة قبل التحديث الرسمي"
     else:
         kind = "🧪 **Snapshot** — نسخة تجريبية فيها أشياء جديدة لسا ما نزلت رسمياً"
-    return {"title": f"⛏️ ماين كرافت {vid}",
-            "url": "https://minecraft.wiki/?search=" + urllib.parse.quote("Java Edition " + vid),
-            "description": f"{kind}\n{how}", "color": 0x5FAD41, "footer": {"text": "ماين كرافت Java — Mojang"},
-            "timestamp": v.get("releaseTime")}
+    text = (v.get("text") or "").strip()
+    if len(text) > 320:
+        text = text[:320].rsplit(" ", 1)[0] + "…"
+    e = {"title": f"⛏️ ماين كرافت {vid}",
+         "url": "https://minecraft.wiki/?search=" + urllib.parse.quote("Java Edition " + vid),
+         "description": "\n\n".join(x for x in (kind, f"📝 {text}" if text else "", how) if x),
+         "color": 0x5FAD41, "footer": {"text": "ماين كرافت Java — من Mojang"}, "timestamp": v.get("time")}
+    if v.get("image"):
+        e["image"] = {"url": v["image"]}
+    return e
 
 
-def run_minecraft(st, webhook):
-    vs = json.loads(http_get(MC_MANIFEST))["versions"]
+def run_mc_versions(st, webhook):
+    vs = mc_versions()
     known = set(st.get("versions", []))
     if not known:
         post(webhook, MC_NAME, {"content": "✅ **تسريبات ماين كرافت اشتغلت!** كل نسخة تجريبية أو تحديث جديد من Mojang، "
                                            "وأهم أخبار ماين كرافت، رح تنزل هون أول بأول ⛏️\nهاي آخر نسخة نزلت:"})
         post(webhook, MC_NAME, {"embeds": [mc_version_embed(vs[0])]})
-        st["versions"] = [v["id"] for v in vs[:60]]
+        st["versions"] = [v["id"] for v in vs[:60] if v["id"]]
         print("   minecraft versions: first run, sample posted")
-    else:
-        new = [v for v in vs[:25] if v["id"] not in known]
-        for v in reversed(new[:3]):
-            post(webhook, MC_NAME, {"embeds": [mc_version_embed(v)]})
-        st["versions"] = (list(known) + [v["id"] for v in new])[-400:]
-        print(f"   minecraft versions: {len(new)} new")
-    run_news(st.setdefault("news", {}), webhook, MC_NAME, MC_NEWS, re.compile(r"minecraft", re.I), MC_NOISE,
-             "أخبار ماين كرافت", 0x5FAD41, "📰 ومن هلأ كمان أهم أخبار ماين كرافت رح تنزل هون.", per_run=2, per_day=5)
+        return
+    new = [v for v in vs[:25] if v["id"] and v["id"] not in known]
+    for v in reversed(new[:3]):
+        post(webhook, MC_NAME, {"embeds": [mc_version_embed(v)]})
+    st["versions"] = (list(known) + [v["id"] for v in new])[-400:]
+    print(f"   minecraft versions: {len(new)} new")
+
+
+def run_mc_official(st, webhook):
+    """Mojang's own news (the cards in the Minecraft launcher), each with its banner."""
+    entries = [e for e in json.loads(http_get(MOJANG + "/v2/news.json"))["entries"]
+               if "Education" not in (e.get("category") or "")]
+    entries.sort(key=lambda e: e.get("date") or "", reverse=True)
+    seen = set(st.get("seen", []))
+    fresh = [e for e in entries if e.get("id") and e["id"] not in seen]
+    chosen = fresh[:1] if not seen else fresh[:3]       # first run: just the latest, as a sample
+    for e in reversed(chosen):
+        text = (e.get("text") or "").strip()
+        banner = (e.get("newsPageImage") or e.get("playPageImage") or {}).get("url")
+        embed = {"title": f"📢 {e.get('title')}", "url": e.get("readMoreLink"),
+                 "description": "\n\n".join(x for x in (text[:350], f"🟩 خبر رسمي من Mojang • {e.get('category')}") if x),
+                 "color": 0x5FAD41, "footer": {"text": "أخبار ماين كرافت الرسمية"}}
+        if banner:
+            embed["image"] = {"url": MOJANG + banner}
+        post(webhook, MC_NAME, {"embeds": [embed]})
+    st["seen"] = (list(seen) + [e["id"] for e in entries if e.get("id")])[-500:]
+    print(f"   minecraft official news: {len(fresh)} new, posted {len(chosen)}")
+
+
+def run_minecraft(st, webhook):
+    st.pop("news", None)                       # the old English Google News headlines are replaced
+    for label, fn, sub in (("versions", run_mc_versions, st),
+                           ("official", run_mc_official, st.setdefault("official", {})),
+                           ("arabic", lambda s, w: run_feeds(s, w, MC_NAME, MC_AR_KEEP, None, "أخبار ماين كرافت",
+                                                             0x5FAD41, per_run=2, per_day=4),
+                            st.setdefault("arabic", {}))):
+        try:
+            fn(sub, webhook)
+        except Exception as e:
+            print(f"   minecraft {label} failed: {e!r}")
 
 
 # ---------------------------------------------------------------- GTA
 GTA_NAME = "تسريبات أبود 🚗"
-GTA_NEWS = ("https://news.google.com/rss/search?q=intitle:GTA+OR+intitle:%22%D8%AC%D9%8A+%D8%AA%D9%8A+%D8%A7%D9%8A%22+OR+"
-            "intitle:%D8%B1%D9%88%D9%83%D8%B3%D8%AA%D8%A7%D8%B1+when:2d&hl=ar&gl=JO&ceid=JO:ar")
 GTA_KEEP = re.compile(r"GTA\s*(6|VI|5|V\b|Online|اونلاين|أونلاين)|جي\s*تي\s*[اأإ]ي|روكستار|Rockstar", re.I)
 GTA_NOISE = re.compile(r"غاز|عملة|gtaification|crypto|بطاقة|youtube|يوتيوب|تحميل|apk|شراء|بيتكوين|سهم|بورصة|مجانا|vietnam", re.I)
 
 
 def run_gta(st, webhook):
-    run_news(st, webhook, GTA_NAME, GTA_NEWS, GTA_KEEP, GTA_NOISE, "أخبار وتسريبات GTA 5 و GTA 6", 0xF59E0B,
-             "✅ **تسريبات GTA اشتغلت!** كل خبر أو تسريب جديد عن GTA 6 و GTA 5 من المواقع العربية رح ينزل هون "
-             "تلقائياً 🚗🔥\nهاي آخر الأخبار:", per_run=3, per_day=10)
+    run_feeds(st, webhook, GTA_NAME, GTA_KEEP, GTA_NOISE, "أخبار وتسريبات GTA 5 و GTA 6", 0xF59E0B,
+              intro="✅ **تسريبات GTA اشتغلت!** كل خبر أو تسريب جديد عن GTA 6 و GTA 5 من المواقع العربية رح ينزل هون "
+                    "تلقائياً 🚗🔥", per_run=3, per_day=10)
 
 
 # ---------------------------------------------------------------- main
