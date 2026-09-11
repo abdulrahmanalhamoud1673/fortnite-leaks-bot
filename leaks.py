@@ -1,52 +1,49 @@
 #!/usr/bin/env python3
-"""Post newly datamined Fortnite cosmetics to a Discord channel, in Arabic.
+"""Leaks & news poster for the أبود قنّاص Discord — Fortnite, Minecraft and GTA.
 
-Runs on a schedule (GitHub Actions). Source: fortnite-api.com /v2/cosmetics/new,
-which lists the items added to the game files by the latest update.
-Only items that were not posted before are sent; state lives in state.json.
+Runs every 30 minutes on GitHub Actions. Each game posts to its own channel through
+its own webhook secret; a game whose secret is missing is simply skipped.
+
+  fortnite   DISCORD_WEBHOOK            items datamined into the game files (fortnite-api.com)
+  minecraft  DISCORD_WEBHOOK_MINECRAFT  new Java snapshots/pre-releases/releases (Mojang) + news
+  gta        DISCORD_WEBHOOK_GTA        Arabic GTA 5 / GTA 6 news headlines (Google News)
+
+Everything already posted is remembered in state.json, so nothing is sent twice.
 """
 import json
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
-API = "https://fortnite-api.com/v2/cosmetics/new?language=ar"
 STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
-
-BOT_NAME = "تسريبات أبود 🔥"
 AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr5Mc6SPFurxKFMqe1m02dQ2z7MgvhIxX8pybPs"
           "=s256-c-k-c0x00ffffff-no-rj")
-MAX_ITEMS = 30          # per update; the rest is summarised in one line
-FIRST_RUN_SAMPLE = 6    # first run only shows a sample, so old leaks don't flood the channel
-UA = {"User-Agent": "abod-leaks-bot/1.0"}
-
-# rarity value -> (sort weight, embed colour)
-RARITY = {
-    "mythic": (9, 0xF4C430), "legendary": (8, 0xF39C12), "icon": (8, 0x2EC4DC),
-    "marvel": (8, 0xC0392B), "dc": (8, 0x3A6BC7), "starwars": (8, 0x3B3B3B),
-    "gaminglegends": (8, 0x6C3FC7), "shadow": (7, 0x505050), "slurp": (7, 0x13C8C8),
-    "frozen": (7, 0x9FD8F0), "lava": (7, 0xD1491A), "dark": (7, 0xB22CB2),
-    "epic": (6, 0x9B59B6), "rare": (4, 0x3498DB), "uncommon": (2, 0x2ECC71), "common": (1, 0x95A5A6),
-}
-TYPE_WEIGHT = {"outfit": 5, "backpack": 3, "pickaxe": 3, "glider": 3, "emote": 3, "wrap": 2}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; abod-leaks-bot/1.1)"}
 
 
-def get_json(url):
+# ---------------------------------------------------------------- helpers
+def http_get(url):
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
+        return r.read()
 
 
 def load_state():
     try:
         with open(STATE, encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
     except (OSError, ValueError):
         return {}
+    if "posted" in state:                      # v1 file held only the Fortnite state
+        state = {"fortnite": state}
+    return state
 
 
 def save_state(state):
@@ -54,12 +51,12 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
-def post(payload):
-    payload = {"username": BOT_NAME, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
+def post(webhook, name, payload):
+    payload = {"username": name, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
     if DRY_RUN:
-        print("DRY:", json.dumps(payload, ensure_ascii=False)[:300])
+        print("   DRY:", json.dumps(payload, ensure_ascii=False)[:260])
         return
-    url = WEBHOOK + ("&" if "?" in WEBHOOK else "?") + "wait=true"
+    url = webhook + ("&" if "?" in webhook else "?") + "wait=true"
     data = json.dumps(payload).encode("utf-8")
     for _ in range(6):
         req = urllib.request.Request(url, data=data, headers={**UA, "Content-Type": "application/json"})
@@ -70,86 +67,212 @@ def post(payload):
             return
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                body = e.read() or b"{}"
-                time.sleep(float(json.loads(body).get("retry_after", 2)) + 0.5)
+                time.sleep(float(json.loads(e.read() or b"{}").get("retry_after", 2)) + 0.5)
                 continue
             raise
     raise RuntimeError("Discord kept rate-limiting the webhook")
 
 
-def weight(item):
+def parse_rss(raw):
+    items = []
+    for it in ET.fromstring(raw).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        source = (it.findtext("source") or "").strip()
+        if source and title.endswith(" - " + source):
+            title = title[: -len(source) - 3]
+        try:
+            pub = parsedate_to_datetime(it.findtext("pubDate") or "")
+        except (TypeError, ValueError):
+            pub = datetime.now(timezone.utc)
+        items.append({"title": title, "link": (it.findtext("link") or "").strip(), "source": source, "pub": pub})
+    return items
+
+
+def norm(title):
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", title.lower())).strip()[:60]
+
+
+def run_news(st, webhook, name, feed, keep, noise, label, color, intro, per_run=3, per_day=10, max_age_h=24):
+    """Post fresh, relevant headlines from an RSS feed; remember links and titles."""
+    items = parse_rss(http_get(feed))
+    seen = set(st.get("seen", []))
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    if st.get("day") != today:
+        st["day"], st["count"] = today, 0
+
+    relevant = [it for it in items
+                if it["link"] not in seen and norm(it["title"]) not in seen
+                and (not keep or keep.search(it["title"]))
+                and not (noise and noise.search(it["title"] + " " + it["source"]))
+                and now - it["pub"] <= timedelta(hours=max_age_h)]
+    relevant.sort(key=lambda x: x["pub"], reverse=True)
+    batch, keys = [], set()                   # the same story from several sites → keep one
+    for it in relevant:
+        key = norm(it["title"])[:35]
+        if key in keys:
+            continue
+        keys.add(key)
+        batch.append(it)
+
+    first = not st.get("seen")
+    room = max(0, per_day - st.get("count", 0))
+    chosen = batch[: (2 if first else min(per_run, room))]
+    if first:
+        post(webhook, name, {"content": intro})
+    for it in reversed(chosen):
+        post(webhook, name, {"embeds": [{
+            "title": it["title"][:250], "url": it["link"], "description": ("📰 " + it["source"])[:300],
+            "color": color, "footer": {"text": label}, "timestamp": it["pub"].isoformat()}]})
+    st["count"] = st.get("count", 0) + (0 if first else len(chosen))
+    st["seen"] = (list(seen) + [x for it in items for x in (it["link"], norm(it["title"]))])[-1500:]
+    print(f"   {label}: {len(items)} in feed, {len(batch)} relevant, posted {len(chosen)}")
+
+
+# ---------------------------------------------------------------- Fortnite
+FN_API = "https://fortnite-api.com/v2/cosmetics/new?language=ar"
+FN_NAME = "تسريبات أبود 🔥"
+RARITY = {
+    "mythic": (9, 0xF4C430), "legendary": (8, 0xF39C12), "icon": (8, 0x2EC4DC),
+    "marvel": (8, 0xC0392B), "dc": (8, 0x3A6BC7), "starwars": (8, 0x3B3B3B),
+    "gaminglegends": (8, 0x6C3FC7), "shadow": (7, 0x505050), "slurp": (7, 0x13C8C8),
+    "frozen": (7, 0x9FD8F0), "lava": (7, 0xD1491A), "dark": (7, 0xB22CB2),
+    "epic": (6, 0x9B59B6), "rare": (4, 0x3498DB), "uncommon": (2, 0x2ECC71), "common": (1, 0x95A5A6),
+}
+TYPE_WEIGHT = {"outfit": 5, "backpack": 3, "pickaxe": 3, "glider": 3, "emote": 3, "wrap": 2}
+
+
+def fn_weight(item):
     rarity = ((item.get("rarity") or {}).get("value") or "").lower()
     kind = ((item.get("type") or {}).get("value") or "").lower()
     return RARITY.get(rarity, (0, 0))[0] * 10 + TYPE_WEIGHT.get(kind, 1)
 
 
-def embed(item):
+def fn_embed(item):
     rarity = item.get("rarity") or {}
     series = item.get("series") or {}
     kind = (item.get("type") or {}).get("displayValue") or ""
-    tag = series.get("value") or rarity.get("displayValue") or ""
-    desc = " • ".join(x for x in (kind, tag) if x)
+    desc = " • ".join(x for x in (kind, series.get("value") or rarity.get("displayValue") or "") if x)
     set_text = (item.get("set") or {}).get("text")
     if set_text:
         desc += "\n" + set_text
     images = item.get("images") or {}
+    e = {"title": (item.get("name") or item.get("id") or "؟")[:250], "description": desc[:400],
+         "color": RARITY.get((rarity.get("value") or "").lower(), (0, 0x8B5CF6))[1]}
     icon = images.get("icon") or images.get("smallIcon")
-    e = {
-        "title": (item.get("name") or item.get("id") or "؟")[:250],
-        "description": desc[:400],
-        "color": RARITY.get((rarity.get("value") or "").lower(), (0, 0x8B5CF6))[1],
-    }
     if icon:
         e["thumbnail"] = {"url": icon}
     return e
 
 
-def short_build(build):
-    m = re.search(r"Release-(\d+\.\d+)", build or "")
-    return m.group(1) if m else (build or "؟")
-
-
-def main():
-    data = get_json(API)["data"]
+def run_fortnite(st, webhook):
+    data = json.loads(http_get(FN_API))["data"]
     items = (data.get("items") or {}).get("br") or []
-    build = short_build(data.get("build"))
-    state = load_state()
-
-    if not WEBHOOK and not DRY_RUN:
-        print("DISCORD_WEBHOOK secret is not set yet — nothing posted.")
-        return
-
-    posted = set(state.get("posted", []))
-    first_run = not state
-    fresh = [x for x in items if x.get("id") not in posted]
+    m = re.search(r"Release-(\d+\.\d+)", data.get("build") or "")
+    build = m.group(1) if m else (data.get("build") or "؟")
+    posted = set(st.get("posted", []))
+    first = not st
+    fresh = sorted((x for x in items if x.get("id") not in posted), key=fn_weight, reverse=True)
     if not fresh:
-        print(f"no new leaks (build {build}, {len(items)} items already posted)")
+        print(f"   fortnite: nothing new (build {build})")
         return
-
-    fresh.sort(key=weight, reverse=True)
-    if first_run:
+    if first:
         header = ("✅ **بوت التسريبات اشتغل!** من هلأ، كل ما ينزل تحديث لفورتنايت، رح توصلكم هون السكنات والرقصات "
                   f"والأدوات الجديدة اللي انضافت لملفات اللعبة 👀\nهاي عيّنة من آخر تحديث ({build}):")
-        chosen = fresh[:FIRST_RUN_SAMPLE]
+        chosen = fresh[:6]
     else:
         header = (f"🔥 **تسريبات جديدة بفورتنايت!** — التحديث {build}\n"
                   f"انضاف {len(fresh)} عنصر جديد لملفات اللعبة (سكنات، رقصات، أدوات…) 👇")
-        chosen = fresh[:MAX_ITEMS]
-
-    post({"content": header})
+        chosen = fresh[:30]
+    post(webhook, FN_NAME, {"content": header})
     for i in range(0, len(chosen), 10):
-        post({"embeds": [embed(x) for x in chosen[i:i + 10]]})
-    extra = len(fresh) - len(chosen)
-    if extra > 0 and not first_run:
-        post({"content": f"➕ وكمان {extra} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀"})
+        post(webhook, FN_NAME, {"embeds": [fn_embed(x) for x in chosen[i:i + 10]]})
+    if len(fresh) > len(chosen) and not first:
+        post(webhook, FN_NAME, {"content": f"➕ وكمان {len(fresh) - len(chosen)} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀"})
+    st.update({"build": data.get("build"), "date": data.get("date"),
+               "posted": sorted(posted | {x.get("id") for x in items if x.get("id")})[-3000:]})
+    print(f"   fortnite: posted {len(chosen)} items from build {build}")
 
-    if DRY_RUN:
-        print(f"DRY RUN: would mark {len(items)} items as posted (build {build})")
-        return
-    state = {"build": data.get("build"), "date": data.get("date"),
-             "posted": sorted(posted | {x.get("id") for x in items if x.get("id")})[-3000:]}
-    save_state(state)
-    print(f"posted {len(chosen)} items from build {build}")
+
+# ---------------------------------------------------------------- Minecraft
+MC_NAME = "تسريبات أبود ⛏️"
+MC_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+MC_NEWS = ("https://news.google.com/rss/search?q=intitle:Minecraft+(snapshot+OR+update+OR+drop+OR+leak+OR+"
+           "%22Minecraft+Live%22+OR+beta)+when:2d&hl=en-US&gl=US&ceid=US:en")
+MC_NOISE = re.compile(
+    r"horion|client|hack|cheat|apk|mod menu|download|crack|youtube|seed|coupon|deal|price"
+    r"|^Minecraft\s+[\d.]+.*(snapshot|pre-release|release candidate)",   # changelogs are covered by the version posts
+    re.I)
+
+
+def mc_version_embed(v):
+    vid = v["id"]
+    how = "من اللانشر: Installations ← New ← اختار النسخة"
+    if v["type"] == "release":
+        kind, how = "✅ **تحديث رسمي نزل!**", "حدّث اللعبة من اللانشر وجرّب الإضافات الجديدة 🎮"
+    elif re.search(r"rc", vid, re.I):
+        kind = "🚀 **Release Candidate** — التحديث الرسمي صار قريب جداً"
+    elif re.search(r"pre", vid, re.I):
+        kind = "🧪 **Pre-Release** — آخر مرحلة قبل التحديث الرسمي"
+    else:
+        kind = "🧪 **Snapshot** — نسخة تجريبية فيها أشياء جديدة لسا ما نزلت رسمياً"
+    return {"title": f"⛏️ ماين كرافت {vid}",
+            "url": "https://minecraft.wiki/?search=" + urllib.parse.quote("Java Edition " + vid),
+            "description": f"{kind}\n{how}", "color": 0x5FAD41, "footer": {"text": "ماين كرافت Java — Mojang"},
+            "timestamp": v.get("releaseTime")}
+
+
+def run_minecraft(st, webhook):
+    vs = json.loads(http_get(MC_MANIFEST))["versions"]
+    known = set(st.get("versions", []))
+    if not known:
+        post(webhook, MC_NAME, {"content": "✅ **تسريبات ماين كرافت اشتغلت!** كل نسخة تجريبية أو تحديث جديد من Mojang، "
+                                           "وأهم أخبار ماين كرافت، رح تنزل هون أول بأول ⛏️\nهاي آخر نسخة نزلت:"})
+        post(webhook, MC_NAME, {"embeds": [mc_version_embed(vs[0])]})
+        st["versions"] = [v["id"] for v in vs[:60]]
+        print("   minecraft versions: first run, sample posted")
+    else:
+        new = [v for v in vs[:25] if v["id"] not in known]
+        for v in reversed(new[:3]):
+            post(webhook, MC_NAME, {"embeds": [mc_version_embed(v)]})
+        st["versions"] = (list(known) + [v["id"] for v in new])[-400:]
+        print(f"   minecraft versions: {len(new)} new")
+    run_news(st.setdefault("news", {}), webhook, MC_NAME, MC_NEWS, re.compile(r"minecraft", re.I), MC_NOISE,
+             "أخبار ماين كرافت", 0x5FAD41, "📰 ومن هلأ كمان أهم أخبار ماين كرافت رح تنزل هون.", per_run=2, per_day=5)
+
+
+# ---------------------------------------------------------------- GTA
+GTA_NAME = "تسريبات أبود 🚗"
+GTA_NEWS = ("https://news.google.com/rss/search?q=intitle:GTA+OR+intitle:%22%D8%AC%D9%8A+%D8%AA%D9%8A+%D8%A7%D9%8A%22+OR+"
+            "intitle:%D8%B1%D9%88%D9%83%D8%B3%D8%AA%D8%A7%D8%B1+when:2d&hl=ar&gl=JO&ceid=JO:ar")
+GTA_KEEP = re.compile(r"GTA\s*(6|VI|5|V\b|Online|اونلاين|أونلاين)|جي\s*تي\s*[اأإ]ي|روكستار|Rockstar", re.I)
+GTA_NOISE = re.compile(r"غاز|عملة|gtaification|crypto|بطاقة|youtube|يوتيوب|تحميل|apk|شراء|بيتكوين|سهم|بورصة|مجانا", re.I)
+
+
+def run_gta(st, webhook):
+    run_news(st, webhook, GTA_NAME, GTA_NEWS, GTA_KEEP, GTA_NOISE, "أخبار وتسريبات GTA 5 و GTA 6", 0xF59E0B,
+             "✅ **تسريبات GTA اشتغلت!** كل خبر أو تسريب جديد عن GTA 6 و GTA 5 من المواقع العربية رح ينزل هون "
+             "تلقائياً 🚗🔥\nهاي آخر الأخبار:", per_run=3, per_day=10)
+
+
+# ---------------------------------------------------------------- main
+def main():
+    state = load_state()
+    jobs = [("fortnite", "DISCORD_WEBHOOK", run_fortnite),
+            ("minecraft", "DISCORD_WEBHOOK_MINECRAFT", run_minecraft),
+            ("gta", "DISCORD_WEBHOOK_GTA", run_gta)]
+    for key, env, fn in jobs:
+        hook = os.environ.get(env, "").strip()
+        if not hook and not DRY_RUN:
+            print(f"{key}: {env} not set yet — skipped")
+            continue
+        print(f"{key}:")
+        try:
+            fn(state.setdefault(key, {}), hook)
+        except Exception as e:                  # one broken source must not stop the others
+            print(f"   {key} failed: {e!r}")
+    if not DRY_RUN:
+        save_state(state)
 
 
 if __name__ == "__main__":
