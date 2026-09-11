@@ -13,7 +13,8 @@ its own webhook secret; a game whose secret is missing is simply skipped.
 
 With GEMINI_API_KEY set, every news post is rewritten as a short, clear Arabic headline + summary
 (arabic.py). If Gemini is busy, the item waits for the next run (up to MAX_HOLDS times) before the
-original text is posted. Everything already posted is remembered in state.json, so nothing is sent twice.
+original text is posted. Big news pings the game's opt-in 🔔 role, so only members who chose it hear
+about it. Everything already posted is remembered in state.json, so nothing is sent twice.
 """
 import html
 import json
@@ -38,6 +39,7 @@ AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/128 Safari/537.36 abod-leaks-bot/1.5"}
 MAX_HOLDS = 3                                   # runs (≈5 min apart) to wait for Gemini before posting the original
+ROLE_FN, ROLE_MC, ROLE_GTA = "1547928400616886273", "1547929115066241095", "1547929149027385477"   # 🔔 opt-in roles
 _CACHE = {}
 
 
@@ -81,6 +83,14 @@ def send(webhook, body, content_type):
                 continue
             raise
     raise RuntimeError("Discord kept rate-limiting the webhook")
+
+
+def with_ping(payload, role):
+    """Mention an opt-in 🔔 role: only the members who picked that game get the notification."""
+    if not role:
+        return payload
+    return {**payload, "content": (f"<@&{role}> " + payload.get("content", "")).strip(),
+            "allowed_mentions": {"parse": [], "roles": [role]}}
 
 
 def post(webhook, name, payload):
@@ -212,7 +222,7 @@ FEEDS_VERSION = 2                              # 1 = Google News headlines witho
 
 
 def news_embed(it, label, color):
-    """(embed, written) — written is False when Gemini couldn't rewrite it and the original text is used."""
+    """(embed, written, important) — written is False when Gemini couldn't rewrite it."""
     image, desc = it.get("image"), it.get("summary") or ""
     if not image or len(desc) < 80:            # thin feed entry: read the article's own og: tags
         og_image, og_desc = page_meta(it["link"])
@@ -234,11 +244,13 @@ def news_embed(it, label, color):
          "color": 0xEF4444 if important else color, "footer": {"text": label}, "timestamp": it["pub"].isoformat()}
     if image:
         e["image"] = {"url": image}
-    return e, ai is not None
+    return e, ai is not None, important
 
 
-def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=3, per_day=10, max_age_h=36):
-    """Fresh, relevant articles from the Arabic gaming sites, each posted with its picture."""
+def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=3, per_day=10, max_age_h=36,
+              role=None):
+    """Fresh, relevant articles from the Arabic gaming sites, each posted with its picture.
+    Important ones ping `role`."""
     items = []
     for url, source in AR_FEEDS:
         try:
@@ -274,11 +286,12 @@ def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=
         post(webhook, name, {"content": intro})
     retry, sent, held = st.get("retry", {}), [], set()
     for it in reversed(chosen):
-        embed, written = news_embed(it, label, color)
+        embed, written, important = news_embed(it, label, color)
         if hold(retry, it["link"], written):
             held.add(it["link"])
             continue
-        post(webhook, name, {"embeds": [embed]})
+        loud = important and not (brand_new or switching)
+        post(webhook, name, with_ping({"embeds": [embed]}, role if loud else None))
         sent.append(it)
     st["retry"] = {k: n for k, n in retry.items() if k in held}
     st["count"] = st.get("count", 0) + len(sent)
@@ -435,11 +448,11 @@ def run_fn_version(st, webhook):
         return
     prev, st["version"] = st.get("version"), ver
     if prev and prev != ver:
-        post(webhook, FN_NAME, {"embeds": [{
+        post(webhook, FN_NAME, with_ping({"embeds": [{
             "title": f"🆕 تحديث فورتنايت {ver} نزل!",
             "description": "حدّثوا اللعبة 🎮\nالسكنات والرقصات الجديدة اللي انضافت بالتحديث رح تنزل هون أول ما تبين 👀",
             "color": 0x8B5CF6, "footer": {"text": f"Fortnite v{ver}"},
-            "timestamp": datetime.now(timezone.utc).isoformat()}]})
+            "timestamp": datetime.now(timezone.utc).isoformat()}]}, ROLE_FN))
     print(f"   fortnite version: {ver}" + (f" (was {prev} — announced)" if prev and prev != ver else ""))
 
 
@@ -467,13 +480,15 @@ def run_fn_leaks(st, webhook):
                  f"⭐ أبرز شي: **{star.get('name') or '؟'}**"]
         if len(fresh) > drawn:
             lines.append(f"➕ وكمان {len(fresh) - drawn} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀")
+    role = None if first else ROLE_FN
     try:
         jpg = cards.draw_card("تسريبات فورتنايت", f"التحديث {build} • {len(fresh)} عنصر جديد بملفات اللعبة",
                               sections, FOOTER, AVATAR)
-        post_file(webhook, FN_NAME, {"embeds": [card_embed(title, lines, "leaks.jpg")]}, "leaks.jpg", jpg)
+        post_file(webhook, FN_NAME, with_ping({"embeds": [card_embed(title, lines, "leaks.jpg")]}, role),
+                  "leaks.jpg", jpg)
     except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
         print(f"   leaks card failed ({e!r}) — sending embeds instead")
-        post(webhook, FN_NAME, {"content": f"**{title}**\n" + "\n".join(lines)})
+        post(webhook, FN_NAME, with_ping({"content": f"**{title}**\n" + "\n".join(lines)}, role))
         for i in range(0, min(30, len(pool)), 10):
             post(webhook, FN_NAME, {"embeds": [fn_embed(x) for x in pool[i:i + 10]]})
     videos = post_videos(webhook, [(x, None) for x in pool[:MAX_TILES]], lookup=False)
@@ -573,12 +588,14 @@ def run_fn_shop(st, webhook):
     lines += extra
     if len(unique) > drawn:
         lines.append(f"➕ وكمان {len(unique) - drawn} عنصر — شوفوهم باللعبة 🎮")
+    role = ROLE_FN if new_day else None         # one ping a day, for the fresh shop — not for every top-up
     try:
         jpg = cards.draw_card("متجر فورتنايت", f"{ar_date(date)} • {len(unique)} عنصر جديد", sections, FOOTER, AVATAR)
-        post_file(webhook, FN_NAME, {"embeds": [card_embed(title, lines, "shop.jpg")]}, "shop.jpg", jpg)
+        post_file(webhook, FN_NAME, with_ping({"embeds": [card_embed(title, lines, "shop.jpg")]}, role),
+                  "shop.jpg", jpg)
     except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
         print(f"   shop card failed ({e!r}) — sending embeds instead")
-        post(webhook, FN_NAME, {"content": f"**{title}**\n" + "\n".join(lines)})
+        post(webhook, FN_NAME, with_ping({"content": f"**{title}**\n" + "\n".join(lines)}, role))
         for i in range(0, min(20, len(unique)), 10):
             post(webhook, FN_NAME, {"embeds": [shop_embed(e) for e in unique[i:i + 10]]})
     pairs = [(it, e.get("finalPrice") if len(e["brItems"]) == 1 else None)
@@ -676,7 +693,7 @@ def run_mc_versions(st, webhook):
         if hold(retry, v["id"], written):
             held.add(v["id"])
             continue
-        post(webhook, MC_NAME, {"embeds": [embed]})
+        post(webhook, MC_NAME, with_ping({"embeds": [embed]}, ROLE_MC))
         done.append(v["id"])
     st["retry"] = {k: n for k, n in retry.items() if k in held}
     st["versions"] = (list(known) + [v["id"] for v in new if v["id"] not in held])[-400:]
@@ -709,14 +726,15 @@ def run_mc_official(st, webhook):
     entries.sort(key=lambda e: e.get("date") or "", reverse=True)
     seen = set(st.get("seen", []))
     fresh = [e for e in entries if e.get("id") and e["id"] not in seen]
-    chosen = fresh[:1] if not seen else fresh[:3]       # first run: just the latest, as a sample
+    first = not seen
+    chosen = fresh[:1] if first else fresh[:3]           # first run: just the latest, as a sample
     retry, done, held = st.get("retry", {}), 0, set()
     for e in reversed(chosen):
         embed, written = mc_official_embed(e)
         if hold(retry, e["id"], written):
             held.add(e["id"])
             continue
-        post(webhook, MC_NAME, {"embeds": [embed]})
+        post(webhook, MC_NAME, with_ping({"embeds": [embed]}, None if first else ROLE_MC))
         done += 1
     st["retry"] = {k: n for k, n in retry.items() if k in held}
     st["seen"] = (list(seen) + [e["id"] for e in entries if e.get("id") and e["id"] not in held])[-500:]
@@ -728,7 +746,7 @@ def run_minecraft(st, webhook):
     for label, fn, sub in (("versions", run_mc_versions, st),
                            ("official", run_mc_official, st.setdefault("official", {})),
                            ("arabic", lambda s, w: run_feeds(s, w, MC_NAME, MC_AR_KEEP, None, "أخبار ماين كرافت",
-                                                             0x5FAD41, per_run=2, per_day=4),
+                                                             0x5FAD41, per_run=2, per_day=4, role=ROLE_MC),
                             st.setdefault("arabic", {}))):
         try:
             fn(sub, webhook)
@@ -745,7 +763,7 @@ GTA_NOISE = re.compile(r"غاز|عملة|gtaification|crypto|بطاقة|youtube|
 def run_gta(st, webhook):
     run_feeds(st, webhook, GTA_NAME, GTA_KEEP, GTA_NOISE, "أخبار وتسريبات GTA 5 و GTA 6", 0xF59E0B,
               intro="✅ **تسريبات GTA اشتغلت!** كل خبر أو تسريب جديد عن GTA 6 و GTA 5 من المواقع العربية رح ينزل هون "
-                    "تلقائياً 🚗🔥", per_run=3, per_day=10)
+                    "تلقائياً 🚗🔥", per_run=3, per_day=10, role=ROLE_GTA)
 
 
 # ---------------------------------------------------------------- main
@@ -754,7 +772,7 @@ def selftest():
     print("selftest: GEMINI_API_KEY is", "set" if arabic.enabled() else "MISSING")
     try:
         items = parse_rss(http_get(AR_FEEDS[0][0]), AR_FEEDS[0][1])
-        e, ok = news_embed(next(x for x in items if GTA_KEEP.search(x["title"])), "selftest", 0xF59E0B)
+        e, ok, _ = news_embed(next(x for x in items if GTA_KEEP.search(x["title"])), "selftest", 0xF59E0B)
         print("selftest GTA:", "rewritten" if ok else "ORIGINAL",
               json.dumps({"title": e["title"], "description": e["description"]}, ensure_ascii=False))
         m, ok = mc_version_embed(mc_versions()[0])
