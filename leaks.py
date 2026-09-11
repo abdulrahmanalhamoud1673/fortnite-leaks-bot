@@ -5,7 +5,8 @@ Runs on GitHub Actions about every 10 minutes. Each game posts to its own channe
 its own webhook secret; a game whose secret is missing is simply skipped.
 
   fortnite   DISCORD_WEBHOOK            new game versions, items datamined into the game files and
-                                        what is new in the item shop (fortnite-api.com)
+                                        what is new in the item shop (fortnite-api.com), drawn as one
+                                        zoomable picture (cards.py) plus Epic's clips of the emotes
   minecraft  DISCORD_WEBHOOK_MINECRAFT  new Java snapshots/pre-releases/releases (Mojang) + news
   gta        DISCORD_WEBHOOK_GTA        Arabic GTA 5 / GTA 6 news headlines (Google News)
 
@@ -22,11 +23,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+import cards
+
+STATE = os.environ.get("LEAKS_STATE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
+PREVIEW = os.environ.get("PREVIEW_DIR")          # with DRY_RUN, pictures are written here instead of sent
 AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr5Mc6SPFurxKFMqe1m02dQ2z7MgvhIxX8pybPs"
           "=s256-c-k-c0x00ffffff-no-rj")
-UA = {"User-Agent": "Mozilla/5.0 (compatible; abod-leaks-bot/1.2)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; abod-leaks-bot/1.3)"}
 
 
 # ---------------------------------------------------------------- helpers
@@ -52,17 +56,12 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
-def post(webhook, name, payload):
-    payload = {"username": name, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
-    if DRY_RUN:
-        print("   DRY:", json.dumps(payload, ensure_ascii=False)[:260])
-        return
+def send(webhook, body, content_type):
     url = webhook + ("&" if "?" in webhook else "?") + "wait=true"
-    data = json.dumps(payload).encode("utf-8")
     for _ in range(6):
-        req = urllib.request.Request(url, data=data, headers={**UA, "Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=body, headers={**UA, "Content-Type": content_type})
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=60) as r:
                 r.read()
             time.sleep(1.2)
             return
@@ -72,6 +71,32 @@ def post(webhook, name, payload):
                 continue
             raise
     raise RuntimeError("Discord kept rate-limiting the webhook")
+
+
+def post(webhook, name, payload):
+    payload = {"username": name, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
+    if DRY_RUN:
+        print("   DRY:", json.dumps(payload, ensure_ascii=False)[:260])
+        return
+    send(webhook, json.dumps(payload).encode("utf-8"), "application/json")
+
+
+def post_file(webhook, name, payload, filename, data):
+    """A message with one attached picture, which an embed can show as attachment://<filename>."""
+    payload = {"username": name, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
+    if DRY_RUN:
+        if PREVIEW:
+            with open(os.path.join(PREVIEW, filename), "wb") as f:
+                f.write(data)
+        print(f"   DRY: {filename} ({len(data) // 1024} KB) +", json.dumps(payload, ensure_ascii=False)[:200])
+        return
+    boundary = "abodleaks" + os.urandom(8).hex()
+    body = b"".join([
+        (f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
+         "Content-Type: application/json\r\n\r\n").encode(), json.dumps(payload).encode("utf-8"),
+        (f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'
+         "Content-Type: image/jpeg\r\n\r\n").encode(), data, f"\r\n--{boundary}--\r\n".encode()])
+    send(webhook, body, f"multipart/form-data; boundary={boundary}")
 
 
 def parse_rss(raw):
@@ -134,7 +159,10 @@ def run_news(st, webhook, name, feed, keep, noise, label, color, intro, per_run=
 FN_API = "https://fortnite-api.com/v2/cosmetics/new?language=ar"
 FN_AES = "https://fortnite-api.com/v2/aes"                       # its build changes the moment a version ships
 FN_SHOP = "https://fortnite-api.com/v2/shop?language=ar"
+FN_ITEM = "https://fortnite-api.com/v2/cosmetics/br/"
 FN_NAME = "تسريبات أبود 🔥"
+FOOTER = "تسريبات أبود  •  كل جديد فورتنايت أول بأول  •  youtube.com/@Ab_sn6"
+SHOP_DESIGN = 2                                # bump to re-post today's shop once in a new look
 RARITY = {
     "mythic": (9, 0xF4C430), "legendary": (8, 0xF39C12), "icon": (8, 0x2EC4DC),
     "marvel": (8, 0xC0392B), "dc": (8, 0x3A6BC7), "starwars": (8, 0x3B3B3B),
@@ -167,6 +195,45 @@ def fn_weight(item):
     return RARITY.get(rarity, (0, 0))[0] * 10 + TYPE_WEIGHT.get(item_kind(item), 1)
 
 
+def card_embed(title, lines, filename):
+    return {"title": title, "description": "\n".join(lines), "color": 0x8B5CF6,
+            "image": {"url": f"attachment://{filename}"},
+            "footer": {"text": "تسريبات أبود • اضغط على الصورة وكبّرها 🔍"},
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+def showcase_video(item, lookup):
+    """Epic's own showcase clip on YouTube: Discord plays it inside the channel."""
+    vid = item.get("showcaseVideo")
+    if not vid and lookup and item.get("id"):
+        try:
+            vid = json.loads(http_get(FN_ITEM + item["id"]))["data"].get("showcaseVideo")
+        except Exception:
+            vid = None
+    return vid
+
+
+def post_videos(webhook, pairs, lookup, limit=4, max_lookups=12):
+    """pairs: (item, price or None). Emotes first — a picture can't show a dance — then outfits."""
+    order = {"emote": 0, "outfit": 1}
+    done, ids, shown = 0, set(), 0
+    for item, price in sorted(pairs, key=lambda p: order.get(item_kind(p[0]), 2)):
+        if item.get("id") in ids or done >= max_lookups or shown >= limit:
+            continue
+        ids.add(item.get("id"))
+        done += 1
+        vid = showcase_video(item, lookup)
+        if not vid:
+            continue
+        name, tail = item.get("name") or "؟", (f" • {price:,} V-Bucks" if price else "")
+        caption = {"emote": f"💃 **{name}** — شوفوا الرقصة ▶️{tail}",
+                   "outfit": f"🧍 **{name}** — شوفوا السكن من كل الجهات ▶️{tail}"}.get(
+            item_kind(item), f"✨ **{name}** ▶️{tail}")
+        post(webhook, FN_NAME, {"content": f"{caption}\nhttps://www.youtube.com/watch?v={vid}"})
+        shown += 1
+    return shown
+
+
 def fn_embed(item):
     rarity = item.get("rarity") or {}
     series = item.get("series") or {}
@@ -182,6 +249,23 @@ def fn_embed(item):
     if icon:
         e["thumbnail"] = {"url": icon}
     return e
+
+
+def leak_tiles(items):
+    tiles = []
+    for it in items:
+        series = (it.get("series") or {}).get("colors") or []
+        base = RARITY.get(((it.get("rarity") or {}).get("value") or "").lower(), (0, 0x8B5CF6))[1]
+        base = ((base >> 16) & 255, (base >> 8) & 255, base & 255)
+        colors = ((cards.hex_rgb(series[0]), cards.hex_rgb(series[-1])) if len(series) >= 2
+                  else (cards.shade(base, 1.25), cards.shade(base, 0.45)))
+        images = it.get("images") or {}
+        line = " • ".join(x for x in ((it.get("type") or {}).get("displayValue"),
+                                      (it.get("series") or {}).get("value")
+                                      or (it.get("rarity") or {}).get("displayValue")) if x)
+        tiles.append({"name": it.get("name") or it.get("id") or "؟", "line": line, "colors": colors,
+                      "image": images.get("featured") or images.get("icon") or images.get("smallIcon")})
+    return tiles
 
 
 def run_fn_version(st, webhook):
@@ -210,22 +294,29 @@ def run_fn_leaks(st, webhook):
     if not fresh:
         print(f"   fortnite leaks: nothing new (build {build})")
         return
+    top = fresh[:(6 if first else 30)]
     if first:
-        header = ("✅ **بوت التسريبات اشتغل!** من هلأ، كل ما ينزل تحديث لفورتنايت، رح توصلكم هون السكنات والرقصات "
-                  f"والأدوات الجديدة اللي انضافت لملفات اللعبة 👀\nهاي عيّنة من آخر تحديث ({build}):")
-        chosen = fresh[:6]
+        title = "✅ بوت التسريبات اشتغل!"
+        lines = ["من هلأ، كل ما ينزل تحديث لفورتنايت، رح توصلكم هون السكنات والرقصات والأدوات الجديدة "
+                 f"اللي انضافت لملفات اللعبة 👀", f"هاي عيّنة من آخر تحديث ({build})"]
     else:
-        header = (f"🔥 **تسريبات جديدة بفورتنايت!** — التحديث {build}\n"
-                  f"انضاف {len(fresh)} عنصر جديد لملفات اللعبة (سكنات، رقصات، أدوات…) 👇")
-        chosen = fresh[:30]
-    post(webhook, FN_NAME, {"content": header})
-    for i in range(0, len(chosen), 10):
-        post(webhook, FN_NAME, {"embeds": [fn_embed(x) for x in chosen[i:i + 10]]})
-    if len(fresh) > len(chosen) and not first:
-        post(webhook, FN_NAME, {"content": f"➕ وكمان {len(fresh) - len(chosen)} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀"})
+        title = "🔥 تسريبات جديدة بفورتنايت!"
+        lines = [f"🧩 التحديث {build}", f"🆕 انضاف {len(fresh)} عنصر جديد لملفات اللعبة (سكنات، رقصات، أدوات…)"]
+        if len(fresh) > len(top):
+            lines.append(f"➕ وكمان {len(fresh) - len(top)} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀")
+    try:
+        jpg = cards.draw_card("تسريبات فورتنايت", f"التحديث {build} • {len(fresh)} عنصر جديد بملفات اللعبة",
+                              leak_tiles(top), FOOTER, AVATAR)
+        post_file(webhook, FN_NAME, {"embeds": [card_embed(title, lines, "leaks.jpg")]}, "leaks.jpg", jpg)
+    except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
+        print(f"   leaks card failed ({e!r}) — sending embeds instead")
+        post(webhook, FN_NAME, {"content": f"**{title}**\n" + "\n".join(lines)})
+        for i in range(0, len(top), 10):
+            post(webhook, FN_NAME, {"embeds": [fn_embed(x) for x in top[i:i + 10]]})
+    videos = post_videos(webhook, [(x, None) for x in top], lookup=False)
     st.update({"build": data.get("build"), "date": data.get("date"),
                "posted": sorted(posted | {x.get("id") for x in items if x.get("id")})[-3000:]})
-    print(f"   fortnite leaks: posted {len(chosen)} items from build {build}")
+    print(f"   fortnite leaks: {len(fresh)} new from build {build}, card with {len(top)}, {videos} videos")
 
 
 def shop_weight(entry):
@@ -233,10 +324,14 @@ def shop_weight(entry):
     return (1 if entry.get("bundle") else 0, max(TYPE_WEIGHT.get(k, 1) for k in kinds), entry.get("finalPrice") or 0)
 
 
+def shop_main(entry):
+    return max(entry["brItems"], key=lambda it: TYPE_WEIGHT.get(item_kind(it), 1))
+
+
 def shop_embed(entry):
     items = entry["brItems"]
     bundle = entry.get("bundle") or {}
-    main = max(items, key=lambda it: TYPE_WEIGHT.get(item_kind(it), 1))
+    main = shop_main(entry)
     price, regular = entry.get("finalPrice") or 0, entry.get("regularPrice") or 0
     lines = [f"💰 **{price:,}** V-Bucks" + (f"  (بدل ~~{regular:,}~~) 🔻" if regular > price else "")]
     kind = f"📦 باقة فيها {len(items)} عناصر" if bundle else (main.get("type") or {}).get("displayValue") or ""
@@ -253,8 +348,24 @@ def shop_embed(entry):
     return e
 
 
+def shop_tiles(entries):
+    tiles = []
+    for e in entries:
+        bundle, main, c = e.get("bundle") or {}, shop_main(e), e.get("colors") or {}
+        renders = (e.get("newDisplayAsset") or {}).get("renderImages") or []
+        tiles.append({"name": bundle.get("name") or main.get("name") or "؟",
+                      "price": e.get("finalPrice"), "regular": e.get("regularPrice"),
+                      "badge": "باقة" if bundle else (main.get("type") or {}).get("displayValue"),
+                      "colors": (cards.hex_rgb(c.get("color1")), cards.hex_rgb(c.get("color3") or c.get("color2"))),
+                      "image": (renders[0].get("image") if renders else None) or bundle.get("image")
+                      or (main.get("images") or {}).get("icon")})
+    return tiles
+
+
 def run_fn_shop(st, webhook):
     """What is new in the item shop — after each daily reset and whenever items get added."""
+    if st.get("design") != SHOP_DESIGN:        # a new look: show today's shop once more in it
+        st.clear()
     data = json.loads(http_get(FN_SHOP))["data"]
     if data.get("hash") and data.get("hash") == st.get("hash"):
         print("   fortnite shop: unchanged")
@@ -267,7 +378,7 @@ def run_fn_shop(st, webhook):
     else:                                                                  # first run: what came with today's reset
         fresh = [e for e in entries if (e.get("inDate") or "")[:10] == date]
     new_day = bool(known) and st.get("date") != date
-    st.update({"hash": data.get("hash"), "date": date,
+    st.update({"design": SHOP_DESIGN, "hash": data.get("hash"), "date": date,
                "offers": [e.get("offerId") for e in entries if e.get("offerId")]})
     names, unique = set(), []                  # one item can sit in several offers → show it once
     for e in sorted(fresh, key=shop_weight, reverse=True):
@@ -278,19 +389,29 @@ def run_fn_shop(st, webhook):
     if not unique:
         print("   fortnite shop: changed, nothing new")
         return
+    top = unique[:30]
     if not known:
-        head = f"🛒 **متجر فورتنايت اليوم** — {ar_date(date)}\nمن هلأ، كل ما يتجدد المتجر رح ينزل هون الجديد فيه أول بأول 👇"
+        title = "🛒 متجر فورتنايت اليوم"
+        lines = [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد",
+                 "من هلأ، كل ما يتجدد المتجر (الساعة 3 الفجر) رح ينزل هون الجديد فيه أول بأول"]
     elif new_day:
-        head = f"🛒 **متجر فورتنايت الجديد نزل!** — {ar_date(date)}\n🆕 {len(unique)} عنصر جديد اليوم 👇"
+        title, lines = "🛒 متجر فورتنايت الجديد نزل!", [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد اليوم"]
     else:
-        head = f"🛒 **انضافت أشياء جديدة للمتجر!** — {ar_date(date)}\n🆕 {len(unique)} عنصر جديد 👇"
-    post(webhook, FN_NAME, {"content": head})
-    shown = unique[:20]
-    for i in range(0, len(shown), 10):
-        post(webhook, FN_NAME, {"embeds": [shop_embed(e) for e in shown[i:i + 10]]})
-    if len(unique) > len(shown):
-        post(webhook, FN_NAME, {"content": f"➕ وكمان {len(unique) - len(shown)} عنصر جديد بالمتجر — شوفوه كامل باللعبة 🎮"})
-    print(f"   fortnite shop: {len(unique)} new offers, posted {len(shown)}")
+        title, lines = "🛒 انضافت أشياء جديدة للمتجر!", [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد"]
+    if len(unique) > len(top):
+        lines.append(f"➕ وكمان {len(unique) - len(top)} عنصر — شوفوهم باللعبة 🎮")
+    try:
+        jpg = cards.draw_card("متجر فورتنايت", f"{ar_date(date)} • {len(unique)} عنصر جديد", shop_tiles(top),
+                              FOOTER, AVATAR)
+        post_file(webhook, FN_NAME, {"embeds": [card_embed(title, lines, "shop.jpg")]}, "shop.jpg", jpg)
+    except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
+        print(f"   shop card failed ({e!r}) — sending embeds instead")
+        post(webhook, FN_NAME, {"content": f"**{title}**\n" + "\n".join(lines)})
+        for i in range(0, min(20, len(top)), 10):
+            post(webhook, FN_NAME, {"embeds": [shop_embed(e) for e in top[i:i + 10]]})
+    pairs = [(it, e.get("finalPrice") if len(e["brItems"]) == 1 else None) for e in top for it in e["brItems"]]
+    videos = post_videos(webhook, pairs, lookup=True)
+    print(f"   fortnite shop: {len(unique)} new offers, card with {len(top)}, {videos} videos")
 
 
 def run_fortnite(st, webhook):
