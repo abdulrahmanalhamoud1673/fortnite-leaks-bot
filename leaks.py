@@ -12,8 +12,8 @@ its own webhook secret; a game whose secret is missing is simply skipped.
   gta        DISCORD_WEBHOOK_GTA        GTA 5 / GTA 6 news from Arabic gaming sites, each with its picture
 
 With GEMINI_API_KEY set, every news post is rewritten as a short, clear Arabic headline + summary
-(arabic.py); without it the original text is posted. Everything already posted is remembered in
-state.json, so nothing is sent twice.
+(arabic.py). If Gemini is busy, the item waits for the next run (up to MAX_HOLDS times) before the
+original text is posted. Everything already posted is remembered in state.json, so nothing is sent twice.
 """
 import html
 import json
@@ -37,6 +37,7 @@ AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr
           "=s256-c-k-c0x00ffffff-no-rj")
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/128 Safari/537.36 abod-leaks-bot/1.5"}
+MAX_HOLDS = 3                                   # runs (≈5 min apart) to wait for Gemini before posting the original
 _CACHE = {}
 
 
@@ -106,6 +107,15 @@ def post_file(webhook, name, payload, filename, data):
         (f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'
          "Content-Type: image/jpeg\r\n\r\n").encode(), data, f"\r\n--{boundary}--\r\n".encode()])
     send(webhook, body, f"multipart/form-data; boundary={boundary}")
+
+
+def hold(retry, key, written):
+    """True = keep this item for the next run: Gemini failed and there are holds left."""
+    if written or not arabic.enabled() or retry.get(key, 0) >= MAX_HOLDS:
+        retry.pop(key, None)
+        return False
+    retry[key] = retry.get(key, 0) + 1
+    return True
 
 
 def norm(title):
@@ -202,6 +212,7 @@ FEEDS_VERSION = 2                              # 1 = Google News headlines witho
 
 
 def news_embed(it, label, color):
+    """(embed, written) — written is False when Gemini couldn't rewrite it and the original text is used."""
     image, desc = it.get("image"), it.get("summary") or ""
     if not image or len(desc) < 80:            # thin feed entry: read the article's own og: tags
         og_image, og_desc = page_meta(it["link"])
@@ -223,7 +234,7 @@ def news_embed(it, label, color):
          "color": 0xEF4444 if important else color, "footer": {"text": label}, "timestamp": it["pub"].isoformat()}
     if image:
         e["image"] = {"url": image}
-    return e
+    return e, ai is not None
 
 
 def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=3, per_day=10, max_age_h=36):
@@ -261,13 +272,22 @@ def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=
     chosen = batch[: (2 if brand_new else 1 if switching else min(per_run, room))]
     if brand_new and intro:
         post(webhook, name, {"content": intro})
+    retry, sent, held = st.get("retry", {}), [], set()
     for it in reversed(chosen):
-        post(webhook, name, {"embeds": [news_embed(it, label, color)]})
-    st["count"] = st.get("count", 0) + len(chosen)
-    st["seen"] = (list(seen) + [x for it in items for x in (it["link"], norm(it["title"]))])[-2000:]
-    st["titles"] = (posted + [[it["pub"].astimezone(timezone.utc).isoformat(), it["title"]] for it in chosen])[-150:]
+        embed, written = news_embed(it, label, color)
+        if hold(retry, it["link"], written):
+            held.add(it["link"])
+            continue
+        post(webhook, name, {"embeds": [embed]})
+        sent.append(it)
+    st["retry"] = {k: n for k, n in retry.items() if k in held}
+    st["count"] = st.get("count", 0) + len(sent)
+    st["seen"] = (list(seen) + [x for it in items if it["link"] not in held
+                                for x in (it["link"], norm(it["title"]))])[-2000:]
+    st["titles"] = (posted + [[it["pub"].astimezone(timezone.utc).isoformat(), it["title"]] for it in sent])[-150:]
     st["src"] = FEEDS_VERSION
-    print(f"   {label}: {len(items)} articles, {len(batch)} new and relevant, posted {len(chosen)}")
+    print(f"   {label}: {len(items)} articles, {len(batch)} new and relevant, posted {len(sent)}"
+          + (f", {len(held)} held for the Arabic rewrite" if held else ""))
 
 
 # ---------------------------------------------------------------- Fortnite
@@ -609,6 +629,7 @@ def mc_notes_text(v):
 
 
 def mc_version_embed(v):
+    """(embed, written) — written is False when Gemini couldn't write the Arabic summary."""
     vid = v["id"]
     how = "من اللانشر: Installations ← New ← اختار النسخة"
     if v["type"] == "release":
@@ -635,7 +656,7 @@ def mc_version_embed(v):
          "footer": {"text": "ماين كرافت Java — من Mojang"}, "timestamp": v.get("time")}
     if v.get("image"):
         e["image"] = {"url": v["image"]}
-    return e
+    return e, ai is not None
 
 
 def run_mc_versions(st, webhook):
@@ -644,15 +665,41 @@ def run_mc_versions(st, webhook):
     if not known:
         post(webhook, MC_NAME, {"content": "✅ **تسريبات ماين كرافت اشتغلت!** كل نسخة تجريبية أو تحديث جديد من Mojang، "
                                            "وأهم أخبار ماين كرافت، رح تنزل هون أول بأول ⛏️\nهاي آخر نسخة نزلت:"})
-        post(webhook, MC_NAME, {"embeds": [mc_version_embed(vs[0])]})
+        post(webhook, MC_NAME, {"embeds": [mc_version_embed(vs[0])[0]]})
         st["versions"] = [v["id"] for v in vs[:60] if v["id"]]
         print("   minecraft versions: first run, sample posted")
         return
     new = [v for v in vs[:25] if v["id"] and v["id"] not in known]
+    retry, done, held = st.get("retry", {}), [], set()
     for v in reversed(new[:3]):
-        post(webhook, MC_NAME, {"embeds": [mc_version_embed(v)]})
-    st["versions"] = (list(known) + [v["id"] for v in new])[-400:]
-    print(f"   minecraft versions: {len(new)} new")
+        embed, written = mc_version_embed(v)
+        if hold(retry, v["id"], written):
+            held.add(v["id"])
+            continue
+        post(webhook, MC_NAME, {"embeds": [embed]})
+        done.append(v["id"])
+    st["retry"] = {k: n for k, n in retry.items() if k in held}
+    st["versions"] = (list(known) + [v["id"] for v in new if v["id"] not in held])[-400:]
+    print(f"   minecraft versions: {len(new)} new, posted {len(done)}" + (f", {len(held)} held" if held else ""))
+
+
+def mc_official_embed(e):
+    """(embed, written) for one of Mojang's own news cards."""
+    text = (e.get("text") or "").strip()
+    ai = arabic.rewrite("خبر رسمي من Mojang", e.get("title") or "",
+                        (text + "\n" + plain(e.get("articleBody") or ""))[:4000], "Mojang")
+    if ai:
+        title = f"📢 {ai['title']}"
+        lines = [ai["summary"]] + ([bullets(ai["points"])] if ai["points"] else [])
+    else:
+        title, lines = f"📢 {e.get('title')}", [text[:350]] if text else []
+    lines.append(f"🟩 خبر رسمي من Mojang • {e.get('category')}")
+    embed = {"title": title[:250], "url": e.get("readMoreLink"), "description": "\n\n".join(lines)[:1200],
+             "color": 0x5FAD41, "footer": {"text": "أخبار ماين كرافت الرسمية"}}
+    banner = (e.get("newsPageImage") or e.get("playPageImage") or {}).get("url")
+    if banner:
+        embed["image"] = {"url": MOJANG + banner}
+    return embed, ai is not None
 
 
 def run_mc_official(st, webhook):
@@ -663,24 +710,17 @@ def run_mc_official(st, webhook):
     seen = set(st.get("seen", []))
     fresh = [e for e in entries if e.get("id") and e["id"] not in seen]
     chosen = fresh[:1] if not seen else fresh[:3]       # first run: just the latest, as a sample
+    retry, done, held = st.get("retry", {}), 0, set()
     for e in reversed(chosen):
-        text = (e.get("text") or "").strip()
-        ai = arabic.rewrite("خبر رسمي من Mojang", e.get("title") or "",
-                            (text + "\n" + plain(e.get("articleBody") or ""))[:4000], "Mojang")
-        if ai:
-            title = f"📢 {ai['title']}"
-            lines = [ai["summary"]] + ([bullets(ai["points"])] if ai["points"] else [])
-        else:
-            title, lines = f"📢 {e.get('title')}", [text[:350]] if text else []
-        lines.append(f"🟩 خبر رسمي من Mojang • {e.get('category')}")
-        embed = {"title": title[:250], "url": e.get("readMoreLink"), "description": "\n\n".join(lines)[:1200],
-                 "color": 0x5FAD41, "footer": {"text": "أخبار ماين كرافت الرسمية"}}
-        banner = (e.get("newsPageImage") or e.get("playPageImage") or {}).get("url")
-        if banner:
-            embed["image"] = {"url": MOJANG + banner}
+        embed, written = mc_official_embed(e)
+        if hold(retry, e["id"], written):
+            held.add(e["id"])
+            continue
         post(webhook, MC_NAME, {"embeds": [embed]})
-    st["seen"] = (list(seen) + [e["id"] for e in entries if e.get("id")])[-500:]
-    print(f"   minecraft official news: {len(fresh)} new, posted {len(chosen)}")
+        done += 1
+    st["retry"] = {k: n for k, n in retry.items() if k in held}
+    st["seen"] = (list(seen) + [e["id"] for e in entries if e.get("id") and e["id"] not in held])[-500:]
+    print(f"   minecraft official news: {len(fresh)} new, posted {done}" + (f", {len(held)} held" if held else ""))
 
 
 def run_minecraft(st, webhook):
@@ -711,13 +751,15 @@ def run_gta(st, webhook):
 # ---------------------------------------------------------------- main
 def selftest():
     """Print (in the Actions log, nothing is posted) a sample Arabic rewrite, to prove the Gemini key works."""
-    print("selftest: GEMINI_API_KEY is", "set" if os.environ.get("GEMINI_API_KEY") else "MISSING")
+    print("selftest: GEMINI_API_KEY is", "set" if arabic.enabled() else "MISSING")
     try:
         items = parse_rss(http_get(AR_FEEDS[0][0]), AR_FEEDS[0][1])
-        e = news_embed(next(x for x in items if GTA_KEEP.search(x["title"])), "selftest", 0xF59E0B)
-        print("selftest GTA:", json.dumps({"title": e["title"], "description": e["description"]}, ensure_ascii=False))
-        m = mc_version_embed(mc_versions()[0])
-        print("selftest MC:", json.dumps({"title": m["title"], "description": m["description"]}, ensure_ascii=False))
+        e, ok = news_embed(next(x for x in items if GTA_KEEP.search(x["title"])), "selftest", 0xF59E0B)
+        print("selftest GTA:", "rewritten" if ok else "ORIGINAL",
+              json.dumps({"title": e["title"], "description": e["description"]}, ensure_ascii=False))
+        m, ok = mc_version_embed(mc_versions()[0])
+        print("selftest MC:", "rewritten" if ok else "ORIGINAL",
+              json.dumps({"title": m["title"], "description": m["description"]}, ensure_ascii=False))
     except Exception as ex:
         print("selftest failed:", repr(ex))
 
