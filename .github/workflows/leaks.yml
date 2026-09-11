@@ -2,7 +2,9 @@ name: Leaks to Discord (Fortnite, Minecraft, GTA)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes (keeps a private repo inside the free Actions minutes)
+    # twice an hour (keeps a private repo inside the free Actions minutes), off the :00/:30 marks
+    # where GitHub delays or drops scheduled runs under load
+    - cron: "13,43 * * * *"
   workflow_dispatch:
 
 permissions:
