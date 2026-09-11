@@ -1,24 +1,39 @@
 name: Leaks to Discord (Fortnite, Minecraft, GTA)
 
+# Keeps going with nobody's computer on: every run ends by queueing the next one, and that
+# queued run first waits 10 minutes in the "every-10-min" environment (a wait timer, so no
+# runner is held while it waits). The hourly cron is only a backup that restarts the chain.
 on:
   schedule:
-    # twice an hour (keeps a private repo inside the free Actions minutes), off the :00/:30 marks
-    # where GitHub delays or drops scheduled runs under load
-    - cron: "13,43 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
-  push:                      # editing a workflow runs it once, which also nudges GitHub's scheduler awake
+    inputs:
+      chained:
+        description: "Queued by the previous run (waits 10 minutes first)"
+        type: boolean
+        default: false
+  push:
     branches: [main]
-    paths: [".github/workflows/**"]
+    paths: [".github/workflows/**", "leaks.py"]
 
 permissions:
   contents: write
-
-concurrency: leaks
+  actions: write
 
 jobs:
-  post:
+  wait:
+    if: ${{ inputs.chained }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    environment: every-10-min
+    steps:
+      - run: echo "10 minutes since the last check"
+
+  post:
+    needs: wait
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    concurrency: leaks-post
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +51,23 @@ jobs:
             git config user.name "leaks-bot"
             git config user.email "leaks-bot@users.noreply.github.com"
             git add state.json
-            git commit -m "leaks: remember posted items"
-            git push
+            git commit -q -m "leaks: remember posted items"
+            git pull -q --rebase && git push -q
           fi
+      - name: Queue the next run
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # never chain without the wait timer, or runs would fire back to back
+          wait=$(gh api "repos/$GITHUB_REPOSITORY/environments/every-10-min" \
+                   --jq '[.protection_rules[]? | select(.type == "wait_timer") | .wait_timer][0] // 0' || echo 0)
+          if [ "${wait:-0}" -lt 5 ]; then echo "no wait timer, leaving it to the cron"; exit 0; fi
+          queued=$(gh run list -R "$GITHUB_REPOSITORY" -w leaks-bot.yml -L 20 --json databaseId,status \
+                     --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID) | select(.status == \"waiting\" or .status == \"queued\" or .status == \"pending\" or .status == \"requested\")] | length")
+          if [ "${queued:-0}" -gt 0 ]; then echo "next run already queued"; exit 0; fi
+          for i in 1 2 3; do
+            gh workflow run leaks-bot.yml -R "$GITHUB_REPOSITORY" -f chained=true && exit 0
+            sleep 15
+          done
+          exit 1

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Leaks & news poster for the أبود قنّاص Discord — Fortnite, Minecraft and GTA.
 
-Runs every 30 minutes on GitHub Actions. Each game posts to its own channel through
+Runs on GitHub Actions about every 10 minutes. Each game posts to its own channel through
 its own webhook secret; a game whose secret is missing is simply skipped.
 
-  fortnite   DISCORD_WEBHOOK            items datamined into the game files (fortnite-api.com)
+  fortnite   DISCORD_WEBHOOK            new game versions, items datamined into the game files and
+                                        what is new in the item shop (fortnite-api.com)
   minecraft  DISCORD_WEBHOOK_MINECRAFT  new Java snapshots/pre-releases/releases (Mojang) + news
   gta        DISCORD_WEBHOOK_GTA        Arabic GTA 5 / GTA 6 news headlines (Google News)
 
@@ -25,7 +26,7 @@ STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr5Mc6SPFurxKFMqe1m02dQ2z7MgvhIxX8pybPs"
           "=s256-c-k-c0x00ffffff-no-rj")
-UA = {"User-Agent": "Mozilla/5.0 (compatible; abod-leaks-bot/1.1)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; abod-leaks-bot/1.2)"}
 
 
 # ---------------------------------------------------------------- helpers
@@ -131,6 +132,8 @@ def run_news(st, webhook, name, feed, keep, noise, label, color, intro, per_run=
 
 # ---------------------------------------------------------------- Fortnite
 FN_API = "https://fortnite-api.com/v2/cosmetics/new?language=ar"
+FN_AES = "https://fortnite-api.com/v2/aes"                       # its build changes the moment a version ships
+FN_SHOP = "https://fortnite-api.com/v2/shop?language=ar"
 FN_NAME = "تسريبات أبود 🔥"
 RARITY = {
     "mythic": (9, 0xF4C430), "legendary": (8, 0xF39C12), "icon": (8, 0x2EC4DC),
@@ -140,12 +143,28 @@ RARITY = {
     "epic": (6, 0x9B59B6), "rare": (4, 0x3498DB), "uncommon": (2, 0x2ECC71), "common": (1, 0x95A5A6),
 }
 TYPE_WEIGHT = {"outfit": 5, "backpack": 3, "pickaxe": 3, "glider": 3, "emote": 3, "wrap": 2}
+AR_DAYS = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+AR_MONTHS = ["كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران",
+             "تموز", "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول"]
+
+
+def ar_date(iso):
+    d = datetime.strptime(iso[:10], "%Y-%m-%d")
+    return f"{AR_DAYS[d.weekday()]} {d.day} {AR_MONTHS[d.month - 1]}"
+
+
+def fn_version(build):
+    m = re.search(r"Release-(\d+\.\d+)", build or "")
+    return m.group(1) if m else None
+
+
+def item_kind(item):
+    return ((item.get("type") or {}).get("value") or "").lower()
 
 
 def fn_weight(item):
     rarity = ((item.get("rarity") or {}).get("value") or "").lower()
-    kind = ((item.get("type") or {}).get("value") or "").lower()
-    return RARITY.get(rarity, (0, 0))[0] * 10 + TYPE_WEIGHT.get(kind, 1)
+    return RARITY.get(rarity, (0, 0))[0] * 10 + TYPE_WEIGHT.get(item_kind(item), 1)
 
 
 def fn_embed(item):
@@ -165,16 +184,31 @@ def fn_embed(item):
     return e
 
 
-def run_fortnite(st, webhook):
+def run_fn_version(st, webhook):
+    """Announce a new game version as soon as its build appears."""
+    ver = fn_version(json.loads(http_get(FN_AES))["data"].get("build"))
+    if not ver:
+        return
+    prev, st["version"] = st.get("version"), ver
+    if prev and prev != ver:
+        post(webhook, FN_NAME, {"embeds": [{
+            "title": f"🆕 تحديث فورتنايت {ver} نزل!",
+            "description": "حدّثوا اللعبة 🎮\nالسكنات والرقصات الجديدة اللي انضافت بالتحديث رح تنزل هون أول ما تبين 👀",
+            "color": 0x8B5CF6, "footer": {"text": f"Fortnite v{ver}"},
+            "timestamp": datetime.now(timezone.utc).isoformat()}]})
+    print(f"   fortnite version: {ver}" + (f" (was {prev} — announced)" if prev and prev != ver else ""))
+
+
+def run_fn_leaks(st, webhook):
+    """Items datamined into the game files with each update: skins, emotes, pickaxes…"""
     data = json.loads(http_get(FN_API))["data"]
     items = (data.get("items") or {}).get("br") or []
-    m = re.search(r"Release-(\d+\.\d+)", data.get("build") or "")
-    build = m.group(1) if m else (data.get("build") or "؟")
+    build = fn_version(data.get("build")) or (data.get("build") or "؟")
     posted = set(st.get("posted", []))
-    first = not st
+    first = not posted
     fresh = sorted((x for x in items if x.get("id") not in posted), key=fn_weight, reverse=True)
     if not fresh:
-        print(f"   fortnite: nothing new (build {build})")
+        print(f"   fortnite leaks: nothing new (build {build})")
         return
     if first:
         header = ("✅ **بوت التسريبات اشتغل!** من هلأ، كل ما ينزل تحديث لفورتنايت، رح توصلكم هون السكنات والرقصات "
@@ -191,7 +225,81 @@ def run_fortnite(st, webhook):
         post(webhook, FN_NAME, {"content": f"➕ وكمان {len(fresh) - len(chosen)} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀"})
     st.update({"build": data.get("build"), "date": data.get("date"),
                "posted": sorted(posted | {x.get("id") for x in items if x.get("id")})[-3000:]})
-    print(f"   fortnite: posted {len(chosen)} items from build {build}")
+    print(f"   fortnite leaks: posted {len(chosen)} items from build {build}")
+
+
+def shop_weight(entry):
+    kinds = [item_kind(it) for it in entry["brItems"]]
+    return (1 if entry.get("bundle") else 0, max(TYPE_WEIGHT.get(k, 1) for k in kinds), entry.get("finalPrice") or 0)
+
+
+def shop_embed(entry):
+    items = entry["brItems"]
+    bundle = entry.get("bundle") or {}
+    main = max(items, key=lambda it: TYPE_WEIGHT.get(item_kind(it), 1))
+    price, regular = entry.get("finalPrice") or 0, entry.get("regularPrice") or 0
+    lines = [f"💰 **{price:,}** V-Bucks" + (f"  (بدل ~~{regular:,}~~) 🔻" if regular > price else "")]
+    kind = f"📦 باقة فيها {len(items)} عناصر" if bundle else (main.get("type") or {}).get("displayValue") or ""
+    series = (main.get("series") or {}).get("value") or (main.get("rarity") or {}).get("displayValue") or ""
+    lines.append(" • ".join(x for x in (kind, series) if x))
+    if entry.get("outDate"):
+        lines.append(f"⏳ موجود لحد {ar_date(entry['outDate'])}")
+    e = {"title": (bundle.get("name") or main.get("name") or "؟")[:250], "description": "\n".join(lines)[:400],
+         "color": int(((entry.get("colors") or {}).get("color1") or "8b5cf6")[:6], 16)}
+    renders = (entry.get("newDisplayAsset") or {}).get("renderImages") or []
+    image = (renders[0].get("image") if renders else None) or bundle.get("image") or (main.get("images") or {}).get("icon")
+    if image:
+        e["thumbnail"] = {"url": image}
+    return e
+
+
+def run_fn_shop(st, webhook):
+    """What is new in the item shop — after each daily reset and whenever items get added."""
+    data = json.loads(http_get(FN_SHOP))["data"]
+    if data.get("hash") and data.get("hash") == st.get("hash"):
+        print("   fortnite shop: unchanged")
+        return
+    date = (data.get("date") or "")[:10]
+    entries = [e for e in data.get("entries") or [] if e.get("brItems")]   # skins, emotes… not music tracks
+    known = set(st.get("offers", []))
+    if known:
+        fresh = [e for e in entries if e.get("offerId") not in known]
+    else:                                                                  # first run: what came with today's reset
+        fresh = [e for e in entries if (e.get("inDate") or "")[:10] == date]
+    new_day = bool(known) and st.get("date") != date
+    st.update({"hash": data.get("hash"), "date": date,
+               "offers": [e.get("offerId") for e in entries if e.get("offerId")]})
+    names, unique = set(), []                  # one item can sit in several offers → show it once
+    for e in sorted(fresh, key=shop_weight, reverse=True):
+        name = (e.get("bundle") or {}).get("name") or e["brItems"][0].get("name")
+        if name not in names:
+            names.add(name)
+            unique.append(e)
+    if not unique:
+        print("   fortnite shop: changed, nothing new")
+        return
+    if not known:
+        head = f"🛒 **متجر فورتنايت اليوم** — {ar_date(date)}\nمن هلأ، كل ما يتجدد المتجر رح ينزل هون الجديد فيه أول بأول 👇"
+    elif new_day:
+        head = f"🛒 **متجر فورتنايت الجديد نزل!** — {ar_date(date)}\n🆕 {len(unique)} عنصر جديد اليوم 👇"
+    else:
+        head = f"🛒 **انضافت أشياء جديدة للمتجر!** — {ar_date(date)}\n🆕 {len(unique)} عنصر جديد 👇"
+    post(webhook, FN_NAME, {"content": head})
+    shown = unique[:20]
+    for i in range(0, len(shown), 10):
+        post(webhook, FN_NAME, {"embeds": [shop_embed(e) for e in shown[i:i + 10]]})
+    if len(unique) > len(shown):
+        post(webhook, FN_NAME, {"content": f"➕ وكمان {len(unique) - len(shown)} عنصر جديد بالمتجر — شوفوه كامل باللعبة 🎮"})
+    print(f"   fortnite shop: {len(unique)} new offers, posted {len(shown)}")
+
+
+def run_fortnite(st, webhook):
+    for label, fn, sub in (("version", run_fn_version, st), ("leaks", run_fn_leaks, st),
+                           ("shop", run_fn_shop, st.setdefault("shop", {}))):
+        try:
+            fn(sub, webhook)
+        except Exception as e:                  # one broken part must not stop the others
+            print(f"   fortnite {label} failed: {e!r}")
 
 
 # ---------------------------------------------------------------- Minecraft
@@ -246,7 +354,7 @@ GTA_NAME = "تسريبات أبود 🚗"
 GTA_NEWS = ("https://news.google.com/rss/search?q=intitle:GTA+OR+intitle:%22%D8%AC%D9%8A+%D8%AA%D9%8A+%D8%A7%D9%8A%22+OR+"
             "intitle:%D8%B1%D9%88%D9%83%D8%B3%D8%AA%D8%A7%D8%B1+when:2d&hl=ar&gl=JO&ceid=JO:ar")
 GTA_KEEP = re.compile(r"GTA\s*(6|VI|5|V\b|Online|اونلاين|أونلاين)|جي\s*تي\s*[اأإ]ي|روكستار|Rockstar", re.I)
-GTA_NOISE = re.compile(r"غاز|عملة|gtaification|crypto|بطاقة|youtube|يوتيوب|تحميل|apk|شراء|بيتكوين|سهم|بورصة|مجانا", re.I)
+GTA_NOISE = re.compile(r"غاز|عملة|gtaification|crypto|بطاقة|youtube|يوتيوب|تحميل|apk|شراء|بيتكوين|سهم|بورصة|مجانا|vietnam", re.I)
 
 
 def run_gta(st, webhook):
