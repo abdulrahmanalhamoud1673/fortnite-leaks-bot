@@ -1,7 +1,7 @@
 name: Leaks to Discord (Fortnite, Minecraft, GTA)
 
 # Keeps going with nobody's computer on: every run ends by queueing the next one, and that
-# queued run first waits 10 minutes in the "every-10-min" environment (a wait timer, so no
+# queued run first waits 5 minutes in the "every-5-min" environment (a wait timer, so no
 # runner is held while it waits). The hourly cron is only a backup that restarts the chain.
 on:
   schedule:
@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       chained:
-        description: "Queued by the previous run (waits 10 minutes first)"
+        description: "Queued by the previous run (waits 5 minutes first)"
         type: boolean
         default: false
   push:
     branches: [main]
-    paths: [".github/workflows/**", "leaks.py"]
+    paths: [".github/workflows/**", "leaks.py", "cards.py", "arabic.py"]
 
 permissions:
   contents: write
@@ -24,20 +24,20 @@ jobs:
   wait:
     if: ${{ inputs.chained }}
     runs-on: ubuntu-latest
-    environment: every-10-min
+    environment: every-5-min
     steps:
-      - run: echo "10 minutes since the last check"
+      - run: echo "5 minutes since the last check"
 
   post:
     needs: wait
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
     concurrency: leaks-post
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main              # a queued run's own commit is 10+ minutes old; start from the latest state
+          ref: main              # a queued run's own commit is minutes old; start from the latest state
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -47,6 +47,7 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_WEBHOOK_MINECRAFT: ${{ secrets.DISCORD_WEBHOOK_MINECRAFT }}
           DISCORD_WEBHOOK_GTA: ${{ secrets.DISCORD_WEBHOOK_GTA }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       - name: Save what was posted
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
@@ -62,9 +63,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # never chain without the wait timer, or runs would fire back to back
-          wait=$(gh api "repos/$GITHUB_REPOSITORY/environments/every-10-min" \
+          wait=$(gh api "repos/$GITHUB_REPOSITORY/environments/every-5-min" \
                    --jq '[.protection_rules[]? | select(.type == "wait_timer") | .wait_timer][0] // 0' || echo 0)
-          if [ "${wait:-0}" -lt 5 ]; then echo "no wait timer, leaving it to the cron"; exit 0; fi
+          if [ "${wait:-0}" -lt 3 ]; then echo "no wait timer, leaving it to the cron"; exit 0; fi
           queued=$(gh run list -R "$GITHUB_REPOSITORY" -w leaks-bot.yml -L 20 --json databaseId,status \
                      --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID) | select(.status == \"waiting\" or .status == \"queued\" or .status == \"pending\" or .status == \"requested\")] | length")
           if [ "${queued:-0}" -gt 0 ]; then echo "next run already queued"; exit 0; fi

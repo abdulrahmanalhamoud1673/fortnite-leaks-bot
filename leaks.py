@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Leaks & news poster for the أبود قنّاص Discord — Fortnite, Minecraft and GTA.
 
-Runs on GitHub Actions about every 10 minutes. Each game posts to its own channel through
+Runs on GitHub Actions about every 5 minutes. Each game posts to its own channel through
 its own webhook secret; a game whose secret is missing is simply skipped.
 
   fortnite   DISCORD_WEBHOOK            new game versions, items datamined into the game files and
@@ -11,7 +11,9 @@ its own webhook secret; a game whose secret is missing is simply skipped.
                                         Mojang's official news, and Arabic Minecraft news with pictures
   gta        DISCORD_WEBHOOK_GTA        GTA 5 / GTA 6 news from Arabic gaming sites, each with its picture
 
-Everything already posted is remembered in state.json, so nothing is sent twice.
+With GEMINI_API_KEY set, every news post is rewritten as a short, clear Arabic headline + summary
+(arabic.py); without it the original text is posted. Everything already posted is remembered in
+state.json, so nothing is sent twice.
 """
 import html
 import json
@@ -25,6 +27,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
+import arabic
 import cards
 
 STATE = os.environ.get("LEAKS_STATE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -33,7 +36,7 @@ PREVIEW = os.environ.get("PREVIEW_DIR")          # with DRY_RUN, pictures are wr
 AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr5Mc6SPFurxKFMqe1m02dQ2z7MgvhIxX8pybPs"
           "=s256-c-k-c0x00ffffff-no-rj")
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/128 Safari/537.36 abod-leaks-bot/1.4"}
+                    "Chrome/128 Safari/537.36 abod-leaks-bot/1.5"}
 _CACHE = {}
 
 
@@ -141,6 +144,10 @@ def plain(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def bullets(points):
+    return "\n".join("• " + p for p in points)
+
+
 MEDIA = "{http://search.yahoo.com/mrss/}"
 CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
 
@@ -172,15 +179,18 @@ def parse_rss(raw, source=""):
     return items
 
 
-def og_image(url):
-    """The article's own share picture, for feeds that don't carry one."""
+def page_meta(url):
+    """The article's own share picture and description (og: tags), for feeds that carry little."""
     try:
         page = http_get(url)[:600_000].decode("utf-8", "ignore")
     except Exception:
-        return None
-    m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page)
-         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image', page))
-    return html.unescape(m.group(1)) if m else None
+        return None, None
+
+    def og(prop):
+        m = (re.search(rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)', page)
+             or re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}', page))
+        return html.unescape(m.group(1)).strip() if m else None
+    return og("image"), og("description")
 
 
 # ---------------------------------------------------------------- Arabic gaming news (GTA + Minecraft)
@@ -191,16 +201,26 @@ IMPORTANT = re.compile(r"رسمي|تريلر|العرض الدعائي|عرض د
 FEEDS_VERSION = 2                              # 1 = Google News headlines without pictures
 
 
-def news_embed(it, image, label, color):
-    important = bool(IMPORTANT.search(it["title"]))
-    summary = it.get("summary") or ""
-    if len(summary) > 240:
-        summary = summary[:240].rsplit(" ", 1)[0] + "…"
-    lines = [summary] if summary and not summary.startswith(it["title"][:30]) else []
-    lines.append(f"📰 {it['source']}" + ("  •  🔥 **خبر مهم**" if important else ""))
-    e = {"title": (("🔥 " if important else "") + it["title"])[:250], "url": it["link"],
-         "description": "\n\n".join(lines)[:700], "color": 0xEF4444 if important else color,
-         "footer": {"text": label}, "timestamp": it["pub"].isoformat()}
+def news_embed(it, label, color):
+    image, desc = it.get("image"), it.get("summary") or ""
+    if not image or len(desc) < 80:            # thin feed entry: read the article's own og: tags
+        og_image, og_desc = page_meta(it["link"])
+        image = image or og_image
+        if og_desc and len(og_desc) > len(desc):
+            desc = og_desc
+    ai = arabic.rewrite("خبر ألعاب", it["title"], desc, it["source"])
+    if ai:
+        important = ai["important"]
+        title = f"{ai['emoji']} {ai['title']}".strip()
+        body = [ai["summary"]] + ([bullets(ai["points"])] if ai["points"] else [])
+    else:
+        important = bool(IMPORTANT.search(it["title"]))
+        title = ("🔥 " if important else "") + it["title"]
+        summary = desc if len(desc) <= 240 else desc[:240].rsplit(" ", 1)[0] + "…"
+        body = [summary] if summary and not summary.startswith(it["title"][:30]) else []
+    body.append(f"📰 المصدر: {it['source']}" + ("  •  🔥 **خبر مهم**" if important else ""))
+    e = {"title": title[:250], "url": it["link"], "description": "\n\n".join(body)[:1000],
+         "color": 0xEF4444 if important else color, "footer": {"text": label}, "timestamp": it["pub"].isoformat()}
     if image:
         e["image"] = {"url": image}
     return e
@@ -242,7 +262,7 @@ def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=
     if brand_new and intro:
         post(webhook, name, {"content": intro})
     for it in reversed(chosen):
-        post(webhook, name, {"embeds": [news_embed(it, it.get("image") or og_image(it["link"]), label, color)]})
+        post(webhook, name, {"embeds": [news_embed(it, label, color)]})
     st["count"] = st.get("count", 0) + len(chosen)
     st["seen"] = (list(seen) + [x for it in items for x in (it["link"], norm(it["title"]))])[-2000:]
     st["titles"] = (posted + [[it["pub"].astimezone(timezone.utc).isoformat(), it["title"]] for it in chosen])[-150:]
@@ -416,13 +436,15 @@ def run_fn_leaks(st, webhook):
         return
     pool = fresh[:6] if first else fresh
     sections, summary, drawn = group(pool, lambda it: section_key(item_kind(it)), leak_tiles)
+    star = next((x for x in pool if item_kind(x) == "outfit"), pool[0])
     if first:
         title = "✅ بوت التسريبات اشتغل!"
         lines = [f"🧩 التحديث {build}", summary,
                  "من هلأ، كل ما ينزل تحديث لفورتنايت، رح توصلكم هون السكنات والرقصات والأدوات الجديدة 👀"]
     else:
         title = f"🔥 تسريبات جديدة بفورتنايت — التحديث {build}"
-        lines = [f"🆕 انضاف {len(fresh)} عنصر جديد لملفات اللعبة", summary]
+        lines = [f"🆕 انضاف {len(fresh)} عنصر جديد لملفات اللعبة", summary,
+                 f"⭐ أبرز شي: **{star.get('name') or '؟'}**"]
         if len(fresh) > drawn:
             lines.append(f"➕ وكمان {len(fresh) - drawn} عنصر ثاني… رح يبينوا بالمتجر مع الوقت 👀")
     try:
@@ -449,6 +471,10 @@ def shop_main(entry):
     return max(entry["brItems"], key=lambda it: TYPE_WEIGHT.get(item_kind(it), 1))
 
 
+def shop_name(entry):
+    return (entry.get("bundle") or {}).get("name") or shop_main(entry).get("name") or "؟"
+
+
 def shop_embed(entry):
     items = entry["brItems"]
     bundle = entry.get("bundle") or {}
@@ -460,7 +486,7 @@ def shop_embed(entry):
     lines.append(" • ".join(x for x in (kind, series) if x))
     if entry.get("outDate"):
         lines.append(f"⏳ موجود لحد {ar_date(entry['outDate'])}")
-    e = {"title": (bundle.get("name") or main.get("name") or "؟")[:250], "description": "\n".join(lines)[:400],
+    e = {"title": shop_name(entry)[:250], "description": "\n".join(lines)[:400],
          "color": int(((entry.get("colors") or {}).get("color1") or "8b5cf6")[:6], 16)}
     renders = (entry.get("newDisplayAsset") or {}).get("renderImages") or []
     image = (renders[0].get("image") if renders else None) or bundle.get("image") or (main.get("images") or {}).get("icon")
@@ -475,8 +501,8 @@ def shop_tiles(entries):
         bundle, main, c = e.get("bundle") or {}, shop_main(e), e.get("colors") or {}
         renders = (e.get("newDisplayAsset") or {}).get("renderImages") or []
         badge = f"{len(e['brItems'])} عناصر" if bundle else (main.get("type") or {}).get("displayValue")
-        tiles.append({"name": bundle.get("name") or main.get("name") or "؟",
-                      "price": e.get("finalPrice"), "regular": e.get("regularPrice"), "badge": badge,
+        tiles.append({"name": shop_name(e), "price": e.get("finalPrice"), "regular": e.get("regularPrice"),
+                      "badge": badge,
                       "colors": (cards.hex_rgb(c.get("color1")), cards.hex_rgb(c.get("color3") or c.get("color2"))),
                       "image": (renders[0].get("image") if renders else None) or bundle.get("image")
                       or (main.get("images") or {}).get("icon")})
@@ -503,7 +529,7 @@ def run_fn_shop(st, webhook):
                "offers": [e.get("offerId") for e in entries if e.get("offerId")]})
     names, unique = set(), []                  # one item can sit in several offers → show it once
     for e in sorted(fresh, key=shop_weight, reverse=True):
-        name = (e.get("bundle") or {}).get("name") or e["brItems"][0].get("name")
+        name = shop_name(e)
         if name not in names:
             names.add(name)
             unique.append(e)
@@ -519,7 +545,12 @@ def run_fn_shop(st, webhook):
         title, extra = "🛒 متجر فورتنايت الجديد نزل!", []
     else:
         title, extra = "🛒 انضافت أشياء جديدة للمتجر!", []
-    lines = [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد", summary] + extra
+    lines = [f"📅 {ar_date(date)} • 🆕 {len(unique)} عنصر جديد", summary]
+    deals = [e for e in unique if (e.get("regularPrice") or 0) > (e.get("finalPrice") or 0) > 0]
+    if deals:
+        d = max(deals, key=lambda e: (e["regularPrice"] - e["finalPrice"]) / e["regularPrice"])
+        lines.append(f"💥 أقوى خصم: **{shop_name(d)}** بـ {d['finalPrice']:,} بدل ~~{d['regularPrice']:,}~~ V-Bucks")
+    lines += extra
     if len(unique) > drawn:
         lines.append(f"➕ وكمان {len(unique) - drawn} عنصر — شوفوهم باللعبة 🎮")
     try:
@@ -558,11 +589,23 @@ def mc_versions():
         notes = json.loads(http_get(MOJANG + "/v2/javaPatchNotes.json"))["entries"]
         notes.sort(key=lambda e: e.get("date") or "", reverse=True)
         return [{"id": e.get("version"), "type": e.get("type"), "time": e.get("date"), "text": e.get("shortText"),
+                 "path": e.get("contentPath"),
                  "image": MOJANG + e["image"]["url"] if (e.get("image") or {}).get("url") else None} for e in notes]
     except Exception as e:
         print(f"   minecraft patch notes failed ({e!r}) — using the version list")
         return [{"id": v["id"], "type": v["type"], "time": v.get("releaseTime")}
                 for v in json.loads(http_get(MC_MANIFEST))["versions"]]
+
+
+def mc_notes_text(v):
+    """The whole patch note as plain text, so the Arabic summary can pick the real highlights."""
+    text = v.get("text") or ""
+    if v.get("path"):
+        try:
+            text += "\n" + plain(json.loads(http_get(MOJANG + "/v2/" + v["path"])).get("body") or "")
+        except Exception:
+            pass
+    return text[:4000]
 
 
 def mc_version_embed(v):
@@ -576,13 +619,20 @@ def mc_version_embed(v):
         kind = "🧪 **Pre-Release** — آخر مرحلة قبل التحديث الرسمي"
     else:
         kind = "🧪 **Snapshot** — نسخة تجريبية فيها أشياء جديدة لسا ما نزلت رسمياً"
-    text = (v.get("text") or "").strip()
-    if len(text) > 320:
-        text = text[:320].rsplit(" ", 1)[0] + "…"
+    lines = [kind]
+    ai = arabic.rewrite("ملاحظات تحديث ماين كرافت", f"Minecraft {vid}", mc_notes_text(v), "Mojang")
+    if ai:
+        lines.append(ai["summary"])
+        if ai["points"]:
+            lines.append("✨ **أبرز الجديد:**\n" + bullets(ai["points"]))
+    elif v.get("text"):
+        text = v["text"].strip()
+        lines.append("📝 " + (text if len(text) <= 320 else text[:320].rsplit(" ", 1)[0] + "…"))
+    lines.append(how)
     e = {"title": f"⛏️ ماين كرافت {vid}",
          "url": "https://minecraft.wiki/?search=" + urllib.parse.quote("Java Edition " + vid),
-         "description": "\n\n".join(x for x in (kind, f"📝 {text}" if text else "", how) if x),
-         "color": 0x5FAD41, "footer": {"text": "ماين كرافت Java — من Mojang"}, "timestamp": v.get("time")}
+         "description": "\n\n".join(lines)[:1500], "color": 0x5FAD41,
+         "footer": {"text": "ماين كرافت Java — من Mojang"}, "timestamp": v.get("time")}
     if v.get("image"):
         e["image"] = {"url": v["image"]}
     return e
@@ -615,10 +665,17 @@ def run_mc_official(st, webhook):
     chosen = fresh[:1] if not seen else fresh[:3]       # first run: just the latest, as a sample
     for e in reversed(chosen):
         text = (e.get("text") or "").strip()
-        banner = (e.get("newsPageImage") or e.get("playPageImage") or {}).get("url")
-        embed = {"title": f"📢 {e.get('title')}", "url": e.get("readMoreLink"),
-                 "description": "\n\n".join(x for x in (text[:350], f"🟩 خبر رسمي من Mojang • {e.get('category')}") if x),
+        ai = arabic.rewrite("خبر رسمي من Mojang", e.get("title") or "",
+                            (text + "\n" + plain(e.get("articleBody") or ""))[:4000], "Mojang")
+        if ai:
+            title = f"📢 {ai['title']}"
+            lines = [ai["summary"]] + ([bullets(ai["points"])] if ai["points"] else [])
+        else:
+            title, lines = f"📢 {e.get('title')}", [text[:350]] if text else []
+        lines.append(f"🟩 خبر رسمي من Mojang • {e.get('category')}")
+        embed = {"title": title[:250], "url": e.get("readMoreLink"), "description": "\n\n".join(lines)[:1200],
                  "color": 0x5FAD41, "footer": {"text": "أخبار ماين كرافت الرسمية"}}
+        banner = (e.get("newsPageImage") or e.get("playPageImage") or {}).get("url")
         if banner:
             embed["image"] = {"url": MOJANG + banner}
         post(webhook, MC_NAME, {"embeds": [embed]})
