@@ -6,6 +6,9 @@ on:
     # where GitHub delays or drops scheduled runs under load
     - cron: "13,43 * * * *"
   workflow_dispatch:
+  push:                      # editing a workflow runs it once, which also nudges GitHub's scheduler awake
+    branches: [main]
+    paths: [".github/workflows/**"]
 
 permissions:
   contents: write
