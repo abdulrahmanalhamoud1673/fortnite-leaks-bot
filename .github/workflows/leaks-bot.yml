@@ -52,6 +52,7 @@ jobs:
           DISCORD_WEBHOOK_MINECRAFT: ${{ secrets.DISCORD_WEBHOOK_MINECRAFT }}
           DISCORD_WEBHOOK_GTA: ${{ secrets.DISCORD_WEBHOOK_GTA }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           LEAKS_SELFTEST: ${{ inputs.selftest && '1' || '' }}
       - name: Save what was posted
         run: |

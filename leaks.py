@@ -14,7 +14,9 @@ its own webhook secret; a game whose secret is missing is simply skipped.
 With GEMINI_API_KEY set, every news post is rewritten as a short, clear Arabic headline + summary
 (arabic.py). If Gemini is busy, the item waits for the next run (up to MAX_HOLDS times) before the
 original text is posted. Big news pings the game's opt-in 🔔 role, so only members who chose it hear
-about it. Everything already posted is remembered in state.json, so nothing is sent twice.
+about it. The leaks channels are announcement channels: with DISCORD_BOT_TOKEN set (a bot that has
+Manage Messages there), main posts are published so servers that follow the channel receive them.
+Everything already posted is remembered in state.json, so nothing is sent twice.
 """
 import html
 import json
@@ -34,10 +36,11 @@ import cards
 STATE = os.environ.get("LEAKS_STATE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 PREVIEW = os.environ.get("PREVIEW_DIR")          # with DRY_RUN, pictures are written here instead of sent
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 AVATAR = ("https://yt3.googleusercontent.com/64sSctZiJSIBBsfI_R_tWo2tV3bYF2LP0xr5Mc6SPFurxKFMqe1m02dQ2z7MgvhIxX8pybPs"
           "=s256-c-k-c0x00ffffff-no-rj")
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/128 Safari/537.36 abod-leaks-bot/1.5"}
+                    "Chrome/128 Safari/537.36 abod-leaks-bot/1.6"}
 MAX_HOLDS = 3                                   # runs (≈5 min apart) to wait for Gemini before posting the original
 ROLE_FN, ROLE_MC, ROLE_GTA = "1547928400616886273", "1547929115066241095", "1547929149027385477"   # 🔔 opt-in roles
 _CACHE = {}
@@ -69,20 +72,41 @@ def save_state(state):
 
 
 def send(webhook, body, content_type):
+    """Execute the webhook and return the message Discord created (?wait=true)."""
     url = webhook + ("&" if "?" in webhook else "?") + "wait=true"
     for _ in range(6):
         req = urllib.request.Request(url, data=body, headers={**UA, "Content-Type": content_type})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
-                r.read()
+                raw = r.read()
             time.sleep(1.2)
-            return
+            try:
+                return json.loads(raw or b"{}")
+            except ValueError:
+                return {}
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 time.sleep(float(json.loads(e.read() or b"{}").get("retry_after", 2)) + 0.5)
                 continue
             raise
     raise RuntimeError("Discord kept rate-limiting the webhook")
+
+
+def publish(msg):
+    """Crosspost a message of an announcement channel to the servers that follow it.
+    Needs a bot token with Manage Messages there; Discord allows 10 publishes per channel per hour."""
+    if not BOT_TOKEN or not msg or not msg.get("id") or not msg.get("channel_id"):
+        return
+    url = f"https://discord.com/api/v10/channels/{msg['channel_id']}/messages/{msg['id']}/crosspost"
+    req = urllib.request.Request(url, data=b"", method="POST",
+                                 headers={**UA, "Authorization": f"Bot {BOT_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+    except urllib.error.HTTPError as e:         # 429 = hourly limit, 403 = bot lacks Manage Messages
+        print(f"   publish skipped: HTTP {e.code}")
+    except Exception as e:
+        print(f"   publish skipped: {type(e).__name__}")
 
 
 def with_ping(payload, role):
@@ -93,15 +117,18 @@ def with_ping(payload, role):
             "allowed_mentions": {"parse": [], "roles": [role]}}
 
 
-def post(webhook, name, payload):
+def post(webhook, name, payload, announce=False):
     payload = {"username": name, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
     if DRY_RUN:
         print("   DRY:", json.dumps(payload, ensure_ascii=False)[:300])
-        return
-    send(webhook, json.dumps(payload).encode("utf-8"), "application/json")
+        return None
+    msg = send(webhook, json.dumps(payload).encode("utf-8"), "application/json")
+    if announce:
+        publish(msg)
+    return msg
 
 
-def post_file(webhook, name, payload, filename, data):
+def post_file(webhook, name, payload, filename, data, announce=False):
     """A message with one attached picture, which an embed can show as attachment://<filename>."""
     payload = {"username": name, "avatar_url": AVATAR, "allowed_mentions": {"parse": []}, **payload}
     if DRY_RUN:
@@ -109,14 +136,17 @@ def post_file(webhook, name, payload, filename, data):
             with open(os.path.join(PREVIEW, filename), "wb") as f:
                 f.write(data)
         print(f"   DRY: {filename} ({len(data) // 1024} KB) +", json.dumps(payload, ensure_ascii=False)[:300])
-        return
+        return None
     boundary = "abodleaks" + os.urandom(8).hex()
     body = b"".join([
         (f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
          "Content-Type: application/json\r\n\r\n").encode(), json.dumps(payload).encode("utf-8"),
         (f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'
          "Content-Type: image/jpeg\r\n\r\n").encode(), data, f"\r\n--{boundary}--\r\n".encode()])
-    send(webhook, body, f"multipart/form-data; boundary={boundary}")
+    msg = send(webhook, body, f"multipart/form-data; boundary={boundary}")
+    if announce:
+        publish(msg)
+    return msg
 
 
 def hold(retry, key, written):
@@ -291,7 +321,7 @@ def run_feeds(st, webhook, name, keep, noise, label, color, intro=None, per_run=
             held.add(it["link"])
             continue
         loud = important and not (brand_new or switching)
-        post(webhook, name, with_ping({"embeds": [embed]}, role if loud else None))
+        post(webhook, name, with_ping({"embeds": [embed]}, role if loud else None), announce=True)
         sent.append(it)
     st["retry"] = {k: n for k, n in retry.items() if k in held}
     st["count"] = st.get("count", 0) + len(sent)
@@ -452,7 +482,7 @@ def run_fn_version(st, webhook):
             "title": f"🆕 تحديث فورتنايت {ver} نزل!",
             "description": "حدّثوا اللعبة 🎮\nالسكنات والرقصات الجديدة اللي انضافت بالتحديث رح تنزل هون أول ما تبين 👀",
             "color": 0x8B5CF6, "footer": {"text": f"Fortnite v{ver}"},
-            "timestamp": datetime.now(timezone.utc).isoformat()}]}, ROLE_FN))
+            "timestamp": datetime.now(timezone.utc).isoformat()}]}, ROLE_FN), announce=True)
     print(f"   fortnite version: {ver}" + (f" (was {prev} — announced)" if prev and prev != ver else ""))
 
 
@@ -485,10 +515,10 @@ def run_fn_leaks(st, webhook):
         jpg = cards.draw_card("تسريبات فورتنايت", f"التحديث {build} • {len(fresh)} عنصر جديد بملفات اللعبة",
                               sections, FOOTER, AVATAR)
         post_file(webhook, FN_NAME, with_ping({"embeds": [card_embed(title, lines, "leaks.jpg")]}, role),
-                  "leaks.jpg", jpg)
+                  "leaks.jpg", jpg, announce=True)
     except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
         print(f"   leaks card failed ({e!r}) — sending embeds instead")
-        post(webhook, FN_NAME, with_ping({"content": f"**{title}**\n" + "\n".join(lines)}, role))
+        post(webhook, FN_NAME, with_ping({"content": f"**{title}**\n" + "\n".join(lines)}, role), announce=True)
         for i in range(0, min(30, len(pool)), 10):
             post(webhook, FN_NAME, {"embeds": [fn_embed(x) for x in pool[i:i + 10]]})
     videos = post_videos(webhook, [(x, None) for x in pool[:MAX_TILES]], lookup=False)
@@ -592,10 +622,10 @@ def run_fn_shop(st, webhook):
     try:
         jpg = cards.draw_card("متجر فورتنايت", f"{ar_date(date)} • {len(unique)} عنصر جديد", sections, FOOTER, AVATAR)
         post_file(webhook, FN_NAME, with_ping({"embeds": [card_embed(title, lines, "shop.jpg")]}, role),
-                  "shop.jpg", jpg)
+                  "shop.jpg", jpg, announce=True)
     except Exception as e:                      # no Chrome / a broken image: fall back to plain embeds
         print(f"   shop card failed ({e!r}) — sending embeds instead")
-        post(webhook, FN_NAME, with_ping({"content": f"**{title}**\n" + "\n".join(lines)}, role))
+        post(webhook, FN_NAME, with_ping({"content": f"**{title}**\n" + "\n".join(lines)}, role), announce=True)
         for i in range(0, min(20, len(unique)), 10):
             post(webhook, FN_NAME, {"embeds": [shop_embed(e) for e in unique[i:i + 10]]})
     pairs = [(it, e.get("finalPrice") if len(e["brItems"]) == 1 else None)
@@ -693,7 +723,7 @@ def run_mc_versions(st, webhook):
         if hold(retry, v["id"], written):
             held.add(v["id"])
             continue
-        post(webhook, MC_NAME, with_ping({"embeds": [embed]}, ROLE_MC))
+        post(webhook, MC_NAME, with_ping({"embeds": [embed]}, ROLE_MC), announce=True)
         done.append(v["id"])
     st["retry"] = {k: n for k, n in retry.items() if k in held}
     st["versions"] = (list(known) + [v["id"] for v in new if v["id"] not in held])[-400:]
@@ -734,7 +764,7 @@ def run_mc_official(st, webhook):
         if hold(retry, e["id"], written):
             held.add(e["id"])
             continue
-        post(webhook, MC_NAME, with_ping({"embeds": [embed]}, None if first else ROLE_MC))
+        post(webhook, MC_NAME, with_ping({"embeds": [embed]}, None if first else ROLE_MC), announce=True)
         done += 1
     st["retry"] = {k: n for k, n in retry.items() if k in held}
     st["seen"] = (list(seen) + [e["id"] for e in entries if e.get("id") and e["id"] not in held])[-500:]
@@ -769,7 +799,8 @@ def run_gta(st, webhook):
 # ---------------------------------------------------------------- main
 def selftest():
     """Print (in the Actions log, nothing is posted) a sample Arabic rewrite, to prove the Gemini key works."""
-    print("selftest: GEMINI_API_KEY is", "set" if arabic.enabled() else "MISSING")
+    print("selftest: GEMINI_API_KEY is", "set" if arabic.enabled() else "MISSING",
+          "| DISCORD_BOT_TOKEN is", "set" if BOT_TOKEN else "not set")
     try:
         items = parse_rss(http_get(AR_FEEDS[0][0]), AR_FEEDS[0][1])
         e, ok, _ = news_embed(next(x for x in items if GTA_KEEP.search(x["title"])), "selftest", 0xF59E0B)
