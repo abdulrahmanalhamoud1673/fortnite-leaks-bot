@@ -10,6 +10,9 @@ its own webhook secret; a game whose secret is missing is simply skipped.
   minecraft  DISCORD_WEBHOOK_MINECRAFT  every snapshot/pre-release/release with Mojang's own patch-note picture,
                                         Mojang's official news, and Arabic Minecraft news with pictures
   gta        DISCORD_WEBHOOK_GTA        GTA 5 / GTA 6 news from Arabic gaming sites, each with its picture
+  mimic      DISCORD_WEBHOOK_MIMIC      Mimic Party: every official Steam announcement of the developer, with its
+                                        picture, plus an alert when the game goes on sale (store appdetails)
+  chameleon  DISCORD_WEBHOOK_CHAMELEON  MECCHA CHAMELEON: the same, from its own Steam page
 
 With GEMINI_API_KEY set, every news post is rewritten as a short, clear Arabic headline + summary
 (arabic.py). If Gemini is busy, the item waits for the next run (up to MAX_HOLDS times) before the
@@ -43,6 +46,7 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
                     "Chrome/128 Safari/537.36 abod-leaks-bot/1.6"}
 MAX_HOLDS = 3                                   # runs (≈5 min apart) to wait for Gemini before posting the original
 ROLE_FN, ROLE_MC, ROLE_GTA = "1547928400616886273", "1547929115066241095", "1547929149027385477"   # 🔔 opt-in roles
+ROLE_MIMIC, ROLE_CHAM = "1555968703110320228", "1555968813269393470"
 _CACHE = {}
 
 
@@ -796,6 +800,140 @@ def run_gta(st, webhook):
                     "تلقائياً 🚗🔥", per_run=3, per_day=10, role=ROLE_GTA)
 
 
+# ---------------------------------------------------------------- Steam games (Mimic Party, Meccha Chameleon)
+STEAM_NEWS = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid={}&count=20&maxlength=0&format=json"
+STEAM_APP = "https://store.steampowered.com/api/appdetails?appids={}&l=english&cc=JO"
+STEAM_CLAN = "https://clan.cloudflare.steamstatic.com/images/"
+OFFICIAL = {"steam_community_announcements", "steam_updates"}   # the developer's own posts, not fan sites
+
+STEAM_GAMES = {
+    "mimic": {"appid": 5053820, "name": "Mimic Party", "emoji": "🎭", "color": 0xA855F7,
+              "role": ROLE_MIMIC, "poster": "تسريبات أبود 🎭"},
+    "chameleon": {"appid": 4704690, "name": "MECCHA CHAMELEON", "emoji": "🦎", "color": 0x22C55E,
+                  "role": ROLE_CHAM, "poster": "تسريبات أبود 🦎"},
+}
+
+
+def steam_text(raw):
+    """A Steam announcement is BBCode — flatten it to plain text, keeping the line breaks.
+    Patch notes come as [p]…[/p] paragraphs or '- …' lines, and reading as one block loses them."""
+    t = re.sub(r"\[img\][^\[]*\[/img\]", " ", raw or "", flags=re.I)
+    t = re.sub(r"\[/?(p|br|h[1-9]|list|olist|quote)[^\]]*\]", "\n", t, flags=re.I)
+    t = re.sub(r"\[\*\]", "• ", t)
+    t = re.sub(r"\[url=[^\]]*\]|\[/?[a-z][^\]]*\]", " ", t, flags=re.I)
+    t = t.replace("{STEAM_CLAN_IMAGE}", "")
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"[ \t]*\n[ \t]*", "\n", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def steam_image(raw):
+    """The first picture of the announcement, so the post is not a wall of text."""
+    m = re.search(r"\[img\]\s*([^\[\s]+)\s*\[/img\]", raw or "", re.I)
+    url = m.group(1).replace("{STEAM_CLAN_IMAGE}", STEAM_CLAN) if m else ""
+    return url if url.startswith("http") else None
+
+
+def steam_store(appid):
+    """(price_overview, header_image) from the store page — both may be None."""
+    data = (json.loads(http_get(STEAM_APP.format(appid))).get(str(appid)) or {}).get("data") or {}
+    return data.get("price_overview"), data.get("header_image")
+
+
+def steam_embed(game, it, header=None):
+    """(embed, written, important) for one official announcement.
+    These posts carry no picture of their own, so the game's Steam banner rides along as the thumbnail."""
+    body = steam_text(it.get("contents"))
+    ai = arabic.rewrite(f"إعلان أو تحديث رسمي من مطوّر لعبة {game['name']} على Steam",
+                        it.get("title") or "", body[:4000], game["name"])
+    if ai:
+        important = ai["important"]
+        title = f"{ai['emoji']} {ai['title']}".strip()
+        lines = [ai["summary"]] + ([bullets(ai["points"])] if ai["points"] else [])
+    else:
+        important = bool(IMPORTANT.search(it.get("title") or ""))
+        title = f"{game['emoji']} " + (it.get("title") or "")
+        short = body if len(body) <= 240 else body[:240].rsplit(" ", 1)[0] + "…"
+        lines = [short] if short else []
+    lines.append(f"🎮 **{game['name']}** • إعلان رسمي على Steam" + ("  •  🔥 **مهم**" if important else ""))
+    embed = {"title": title[:250], "description": "\n\n".join(lines)[:1200],
+             "url": f"https://store.steampowered.com/news/app/{game['appid']}/view/{it['gid']}",
+             "color": 0xEF4444 if important else game["color"],
+             "footer": {"text": f"{game['emoji']} أخبار {game['name']}"},
+             "timestamp": datetime.fromtimestamp(it.get("date") or 0, timezone.utc).isoformat()}
+    picture = steam_image(it.get("contents"))
+    if picture:
+        embed["image"] = {"url": picture}
+    if header:
+        embed["thumbnail"] = {"url": header}
+    return embed, ai is not None, important
+
+
+def steam_deal(st, webhook, game, price, header, first):
+    """Say it once when the game goes on sale, and once when the sale ends."""
+    pct, was = price.get("discount_percent", 0), st.get("discount")
+    st["discount"] = pct
+    if first or was is None or pct == was:
+        return
+    store = f"https://store.steampowered.com/app/{game['appid']}/"
+    if pct > was:
+        embed = {"title": f"💸 {game['name']} نزلت عرض −{pct}%", "url": store, "color": 0x22C55E,
+                 "description": f"بدل ~~{price.get('initial_formatted', '')}~~ صارت "
+                                f"**{price.get('final_formatted', '')}** على Steam 🔥",
+                 "footer": {"text": f"{game['emoji']} عروض {game['name']}"}}
+        ping = game["role"]
+    else:
+        embed = {"title": f"⏳ خلص عرض {game['name']}", "url": store, "color": 0x9CA3AF,
+                 "description": f"رجع سعرها **{price.get('final_formatted', '')}**.",
+                 "footer": {"text": f"{game['emoji']} عروض {game['name']}"}}
+        ping = None
+    if header:
+        embed["image"] = {"url": header}
+    post(webhook, game["poster"], with_ping({"embeds": [embed]}, ping), announce=True)
+    print(f"   {game['name']}: price {was}% -> {pct}%, posted")
+
+
+def run_steam(st, webhook, game):
+    """Every official Steam announcement for one game, each with its picture, plus sale alerts."""
+    items = [n for n in json.loads(http_get(STEAM_NEWS.format(game["appid"])))["appnews"].get("newsitems", [])
+             if n.get("gid") and n.get("feedname") in OFFICIAL]
+    items.sort(key=lambda n: n.get("date") or 0)
+    seen = set(st.get("seen", []))
+    first = not seen
+    price, header = (None, None)
+    try:
+        price, header = steam_store(game["appid"])
+    except Exception as e:
+        print(f"   {game['name']}: store page failed: {e!r}")
+    if first:
+        intro = {"title": f"{game['emoji']} تسريبات {game['name']} اشتغلت!",
+                 "url": f"https://store.steampowered.com/app/{game['appid']}/", "color": game["color"],
+                 "description": f"كل تحديث أو إعلان رسمي من مطوّر **{game['name']}** على Steam رح ينزل هون "
+                                "تلقائياً، وكمان رح تعرفوا أول ما تنزل اللعبة عرض 💸"}
+        if header:
+            intro["image"] = {"url": header}
+        post(webhook, game["poster"], {"embeds": [intro]}, announce=True)
+    fresh = [n for n in items if n["gid"] not in seen]
+    chosen = fresh[-1:] if first else fresh[-3:]          # first run: the latest one only, as a sample
+    retry, done, held = st.get("retry", {}), 0, set()
+    for n in chosen:
+        embed, written, important = steam_embed(game, n, header)
+        if hold(retry, n["gid"], written):
+            held.add(n["gid"])
+            continue
+        post(webhook, game["poster"],
+             with_ping({"embeds": [embed]}, game["role"] if important and not first else None), announce=True)
+        done += 1
+    st["retry"] = {k: v for k, v in retry.items() if k in held}
+    st["seen"] = (list(seen) + [n["gid"] for n in items if n["gid"] not in held])[-400:]
+    print(f"   {game['name']}: {len(fresh)} new, posted {done}" + (f", {len(held)} held" if held else ""))
+    if price:
+        try:
+            steam_deal(st, webhook, game, price, header, first)
+        except Exception as e:
+            print(f"   {game['name']}: price check failed: {e!r}")
+
+
 # ---------------------------------------------------------------- main
 def selftest():
     """Print (in the Actions log, nothing is posted) a sample Arabic rewrite, to prove the Gemini key works."""
@@ -809,6 +947,12 @@ def selftest():
         m, ok = mc_version_embed(mc_versions()[0])
         print("selftest MC:", "rewritten" if ok else "ORIGINAL",
               json.dumps({"title": m["title"], "description": m["description"]}, ensure_ascii=False))
+        for game in STEAM_GAMES.values():
+            news = json.loads(http_get(STEAM_NEWS.format(game["appid"])))["appnews"].get("newsitems", [])
+            latest = max((n for n in news if n.get("feedname") in OFFICIAL), key=lambda n: n.get("date") or 0)
+            s, ok, _ = steam_embed(game, latest)
+            print(f"selftest {game['name']}:", "rewritten" if ok else "ORIGINAL",
+                  json.dumps({"title": s["title"], "description": s["description"]}, ensure_ascii=False))
     except Exception as ex:
         print("selftest failed:", repr(ex))
 
@@ -819,7 +963,11 @@ def main():
     state = load_state()
     jobs = [("fortnite", "DISCORD_WEBHOOK", run_fortnite),
             ("minecraft", "DISCORD_WEBHOOK_MINECRAFT", run_minecraft),
-            ("gta", "DISCORD_WEBHOOK_GTA", run_gta)]
+            ("gta", "DISCORD_WEBHOOK_GTA", run_gta),
+            ("mimic", "DISCORD_WEBHOOK_MIMIC",
+             lambda s, w: run_steam(s, w, STEAM_GAMES["mimic"])),
+            ("chameleon", "DISCORD_WEBHOOK_CHAMELEON",
+             lambda s, w: run_steam(s, w, STEAM_GAMES["chameleon"]))]
     for key, env, fn in jobs:
         hook = os.environ.get(env, "").strip()
         if not hook and not DRY_RUN:
